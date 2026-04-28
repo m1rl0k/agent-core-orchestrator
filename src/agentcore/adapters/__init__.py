@@ -3,7 +3,6 @@ from agentcore.adapters.cloud_aws import AwsAdapter
 from agentcore.adapters.cloud_azure import AzureAdapter
 from agentcore.adapters.git_local import GitAdapter
 from agentcore.adapters.github_pr import GithubAdapter
-from agentcore.adapters.gitnexus import GitnexusAdapter
 from agentcore.adapters.graphify import GraphifyAdapter, SymbolImpact
 
 __all__ = [
@@ -12,7 +11,6 @@ __all__ = [
     "AzureAdapter",
     "GitAdapter",
     "GithubAdapter",
-    "GitnexusAdapter",
     "GraphifyAdapter",
     "SymbolImpact",
 ]

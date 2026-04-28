@@ -201,12 +201,11 @@ When enabled, Ops can:
 
 ---
 
-## Code-graph integrations
+## Code-graph integration
 
-| Tool        | Runtime  | How agentcore uses it                                         |
-| ----------- | -------- | ------------------------------------------------------------- |
-| **graphify** (default) | in-process Python (`graphifyy`) | Symbol context + impact + subgraph merge into the operational graph after every hop. |
-| gitnexus (fallback)    | shell-out via `npx gitnexus`    | Same surface, used when graphify isn't available.             |
+**graphify** is the in-process code knowledge engine: native-Python tree-sitter
++ NetworkX (the same stack as our operational graph), so subgraphs compose
+without IPC.
 
 The enrichment loop:
 
@@ -239,16 +238,6 @@ of "this is the auth area".
   hooks that POST tool-use events to the orchestrator's `/signal`.
 - For Copilot / Cursor: the same `agent.md` files are picked up if they read
   `AGENTS.md`-style roles. The unknown frontmatter is ignored.
-
----
-
-## Roadmap
-
-- [x] v0: core spec, runtime, four roles, multi-provider router, pgvector + graph, CLI
-- [ ] v0.1: tree-sitter symbol graph (TS, Go, Rust)
-- [ ] v0.2: webhook receiver for GitHub PR events
-- [ ] v0.3: durable task store (postgres-backed checkpointing)
-- [ ] v0.4: ACL on `accepts_handoff_from` (signed handoffs)
 
 ---
 

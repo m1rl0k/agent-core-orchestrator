@@ -1,8 +1,9 @@
 """Minimal code indexer.
 
-Intentionally lightweight. Agents can offload deeper code traversal to MCP
-servers (e.g. gitnexus, code-graph) — this module's only job is to seed the
-vector store with enough chunks for "show me roughly relevant code".
+Intentionally lightweight: deeper code traversal (symbol graphs, references,
+impact analysis) is delegated to graphify (in-process). This module's only
+job is to seed the vector store with enough chunks for "show me roughly
+relevant code".
 
 Scope of v0: Python via AST; everything else as 80-line text chunks. Each
 chunk gets a stable `ref` of the form `code:<relative_path>:<start>-<end>`.
