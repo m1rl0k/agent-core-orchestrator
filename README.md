@@ -27,8 +27,11 @@ through a thin FastAPI orchestrator — universally, on any codebase, on any OS.
   Per-agent provider/model in frontmatter.
 - **Hybrid RAG.** pgvector + Nomic-embed-text v1.5 + a NetworkX/Louvain
   *team & task* graph (who handed off to whom, which tasks touched which
-  files, what the outcome was). Code traversal itself is offloaded to MCPs
-  like gitnexus — agentcore's index is intentionally minimal.
+  files, what the outcome was). Code-symbol traversal is delegated to
+  **graphify** — a native-Python tree-sitter + NetworkX engine — and its
+  `impact()` returns are merged back into the operational graph after every
+  agent hop. Over time, Louvain on the merged graph clusters task families
+  with the symbol neighbourhoods they touch.
 - **Host-credentialed integrations.** Optional GitHub / AWS / Azure adapters
   ride on the host's existing `gh` / `aws` / `az` CLIs — agentcore never
   asks for credentials.
@@ -195,6 +198,37 @@ When enabled, Ops can:
 - triage open PRs, comment, and open remediation PRs (`gh`)
 - listen for failing GitHub Actions runs
 - read CloudWatch alarms / Azure Monitor alerts and escalate to Architect
+
+---
+
+## Code-graph integrations
+
+| Tool        | Runtime  | How agentcore uses it                                         |
+| ----------- | -------- | ------------------------------------------------------------- |
+| **graphify** (default) | in-process Python (`graphifyy`) | Symbol context + impact + subgraph merge into the operational graph after every hop. |
+| gitnexus (fallback)    | shell-out via `npx gitnexus`    | Same surface, used when graphify isn't available.             |
+
+The enrichment loop:
+
+```
+agent emits {files_to_change | diffs}
+        │
+        ▼
+runtime extracts paths
+        │
+        ▼
+graphify.impact(path)  ──►  SymbolImpact(symbol, downstream)
+        │
+        ▼
+KnowledgeGraph
+   .record_change(task, file)
+   .record_impact(task, file, downstream)
+   .merge_subgraph(graphify.subgraph_for([symbol, *downstream]))
+```
+
+After enough tasks, `agent:Architect` ↔ `task:T*` ↔ `file:src/auth/**` ↔
+`symbol:OAuth.*` form a Louvain community — the team's institutional memory
+of "this is the auth area".
 
 ---
 

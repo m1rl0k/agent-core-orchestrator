@@ -19,11 +19,13 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from agentcore.adapters.graphify import GraphifyAdapter
 from agentcore.capabilities import detect_capabilities
 from agentcore.contracts.envelopes import Handoff, new_task_id
 from agentcore.host import detect_host
 from agentcore.llm.router import LLMRouter
 from agentcore.logging_setup import configure_logging
+from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.runtime import Handoff as _H  # noqa: F401 - keep import shape
 from agentcore.orchestrator.runtime import HandoffRejected, Runtime
 from agentcore.orchestrator.traces import TraceLog
@@ -69,7 +71,16 @@ def build_app() -> FastAPI:
     registry = AgentRegistry()
     traces = TraceLog()
     router = LLMRouter(settings)
-    runtime = Runtime(registry=registry, router=router, traces=traces)
+    graph = KnowledgeGraph()
+    graph.load()  # restore prior snapshot if present
+    graphify = (
+        GraphifyAdapter(repo_root=settings.graphify_repo_root, enabled=True)
+        if settings.enable_graphify
+        else None
+    )
+    runtime = Runtime(
+        registry=registry, router=router, traces=traces, graph=graph, graphify=graphify
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ARG001

@@ -1,17 +1,18 @@
 """NetworkX-backed knowledge graph with Louvain community detection.
 
-This is primarily a **team & task history** graph, not a code-symbol graph.
-Code traversal is offloaded to MCP servers (gitnexus, code-graph, etc.) —
-this graph captures the operational layer:
+Primarily a **team & task history** graph, enriched with code-symbol slices
+returned by graphify after each agent hop:
 
-  agent ─[handoff]─▶ agent
-  agent ─[worked_on]─▶ task
-  task  ─[changed]──▶ file
-  task  ─[outcome]──▶ status
+  agent  ─[handoff]─▶ agent
+  agent  ─[worked_on]─▶ task
+  task   ─[changed]──▶ file
+  file   ─[contains]─▶ symbol      (from graphify)
+  symbol ─[calls]────▶ symbol      (from graphify, via merge_subgraph)
+  task   ─[blast_radius]─▶ symbol  (from graphify.impact, via record_impact)
+  task   ─[outcome]──▶ status
 
-Louvain communities reveal "task families" — clusters of work, the agents
-that collaborate on them, and the parts of the codebase they touch. Agents
-reference these via `KnowledgeBinding.graph_communities`.
+Louvain on the merged graph reveals "task families" — clusters of work, the
+agents that collaborate on them, and the symbol neighbourhoods they touch.
 
 Persistence: snapshot to a single JSON file (default `.agentcore/graph.json`).
 """
@@ -79,6 +80,45 @@ class KnowledgeGraph:
         self.add_node(t, kind="task")
         self.add_node(s, kind="status")
         self.add_edge(t, s, weight=1.0, relation="outcome")
+
+    def record_impact(self, task_id: str, file_path: str, downstream: list[str]) -> None:
+        """Wire a task to a file and that file's downstream symbols.
+
+        Used by the enrichment hook after graphify.impact() returns. The
+        downstream symbols become first-class nodes so future Louvain runs
+        can discover task-family ↔ symbol-cluster correspondence.
+        """
+        t = f"task:{task_id}"
+        f = f"file:{file_path}"
+        self.add_node(t, kind="task")
+        self.add_node(f, kind="file")
+        self.add_edge(t, f, weight=1.0, relation="changed")
+        for sym in downstream:
+            s = f"symbol:{sym}"
+            self.add_node(s, kind="symbol")
+            self.add_edge(f, s, weight=0.5, relation="contains")
+            self.add_edge(t, s, weight=0.5, relation="blast_radius")
+
+    def merge_subgraph(self, other: "nx.Graph", *, namespace: str = "symbol") -> int:
+        """Compose another NetworkX graph into ours, namespacing its nodes.
+
+        Returns the number of nodes added. Used by the enrichment hook to
+        absorb graphify's symbol-graph slices (`symbol:OAuth.refresh ─calls─▶
+        symbol:TokenStore.put`, etc.) into the operational graph.
+        """
+        if other is None or other.number_of_nodes() == 0:
+            return 0
+        added = 0
+        for node, attrs in other.nodes(data=True):
+            ns_node = node if str(node).startswith(f"{namespace}:") else f"{namespace}:{node}"
+            if ns_node not in self.g:
+                added += 1
+            self.add_node(ns_node, **{**attrs, "kind": namespace})
+        for u, v, attrs in other.edges(data=True):
+            ns_u = u if str(u).startswith(f"{namespace}:") else f"{namespace}:{u}"
+            ns_v = v if str(v).startswith(f"{namespace}:") else f"{namespace}:{v}"
+            self.add_edge(ns_u, ns_v, **attrs)
+        return added
 
     # ---- community detection -------------------------------------------
 

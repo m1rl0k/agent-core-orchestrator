@@ -72,6 +72,11 @@ class Settings(BaseSettings):
         900, alias="AGENTCORE_SCHEDULED_SCAN_INTERVAL_SECONDS"
     )
 
+    # Graphify: in-process code knowledge graph. Defaults on because it's a
+    # native Python dep; turn off for pure offline / minimal installs.
+    enable_graphify: bool = Field(True, alias="AGENTCORE_ENABLE_GRAPHIFY")
+    graphify_repo_root: Path = Field(Path("."), alias="AGENTCORE_GRAPHIFY_REPO_ROOT")
+
     # Where shell-outs from agents (Bash tool, code-runner) execute.
     #   "host"   -> run directly on the orchestrator's host
     #   "docker" -> wrap in `docker exec` against AGENTCORE_SANDBOX_IMAGE

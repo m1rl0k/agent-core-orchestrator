@@ -21,6 +21,7 @@ from typing import Any
 
 import structlog
 
+from agentcore.adapters.graphify import GraphifyAdapter
 from agentcore.contracts.envelopes import (
     ContractViolation,
     Handoff,
@@ -28,6 +29,7 @@ from agentcore.contracts.envelopes import (
     validate_payload,
 )
 from agentcore.llm.router import ChatMessage, LLMRouter
+from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.spec.loader import AgentRegistry
 from agentcore.spec.models import AgentSpec, Contract
@@ -45,10 +47,15 @@ class Runtime:
         registry: AgentRegistry,
         router: LLMRouter,
         traces: TraceLog | None = None,
+        *,
+        graph: KnowledgeGraph | None = None,
+        graphify: GraphifyAdapter | None = None,
     ) -> None:
         self.registry = registry
         self.router = router
         self.traces = traces or TraceLog()
+        self.graph = graph
+        self.graphify = graphify
 
     async def execute(self, handoff: Handoff) -> tuple[Outcome, Handoff | None]:
         spec = self.registry.get(handoff.to_agent)
@@ -103,6 +110,10 @@ class Runtime:
         self._record(handoff.task_id, handoff.step, "outcome", spec.name,
                      {"status": outcome.status, "delegate_to": delegate_to})
 
+        # 6. Enrichment hook: write to operational graph + pull symbol-level
+        #    impact from graphify and merge it in.
+        self._enrich_graph(handoff, spec, output)
+
         next_handoff = None
         if delegate_to:
             next_handoff = handoff.successor(
@@ -112,6 +123,52 @@ class Runtime:
                 notes=f"emitted by {spec.name}",
             )
         return outcome, next_handoff
+
+    # ------------------------------------------------------------------
+    # Enrichment
+    # ------------------------------------------------------------------
+
+    def _enrich_graph(
+        self, handoff: Handoff, spec: AgentSpec, output: dict[str, Any]
+    ) -> None:
+        if self.graph is None:
+            return
+
+        self.graph.record_handoff(handoff.task_id, handoff.from_agent, spec.name)
+
+        paths = self._extract_paths(output)
+        for p in paths:
+            self.graph.record_change(handoff.task_id, p)
+
+        if not paths or self.graphify is None or not self.graphify.is_ready:
+            return
+
+        # Pull blast-radius from graphify and absorb the relevant symbol slice.
+        for path in paths:
+            impact = self.graphify.impact(path)
+            if impact is None:
+                continue
+            self.graph.record_impact(handoff.task_id, path, impact.downstream)
+            sub = self.graphify.subgraph_for([impact.symbol, *impact.downstream])
+            if sub is not None:
+                self.graph.merge_subgraph(sub, namespace="symbol")
+
+    @staticmethod
+    def _extract_paths(output: dict[str, Any]) -> list[str]:
+        """Pull file paths out of common output shapes (architect/dev/qa)."""
+        paths: list[str] = []
+        for key in ("files_to_change", "diffs"):
+            entries = output.get(key)
+            if not isinstance(entries, list):
+                continue
+            for item in entries:
+                if isinstance(item, dict) and "path" in item:
+                    paths.append(str(item["path"]))
+                elif isinstance(item, str):
+                    paths.append(item)
+        # de-dupe, preserve order
+        seen: set[str] = set()
+        return [p for p in paths if not (p in seen or seen.add(p))]
 
     # ------------------------------------------------------------------
     # Helpers

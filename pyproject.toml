@@ -43,6 +43,11 @@ dependencies = [
   # Code indexing
   "tree-sitter>=0.21",
   "tree-sitter-languages>=1.10",
+
+  # First-class code-graph: graphify (in-process Python).
+  # NetworkX + Leiden + tree-sitter; same stack family we already use, so
+  # graphs compose without serialization.
+  "graphifyy>=0.1",
 ]
 
 [project.optional-dependencies]
