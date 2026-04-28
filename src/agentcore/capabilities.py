@@ -45,7 +45,7 @@ def _which(cmd: str) -> bool:
 
 def _run(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     try:
-        out = subprocess.run(  # noqa: S603 - explicit args, no shell
+        out = subprocess.run(
             cmd,
             capture_output=True,
             text=True,

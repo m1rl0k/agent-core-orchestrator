@@ -133,25 +133,140 @@ class Runtime:
     ) -> None:
         if self.graph is None:
             return
+        from agentcore.memory.prf import (
+            HIGH_BLAST_RADIUS,
+            LOW_BLAST_RADIUS,
+            classify_change_kinds,
+        )
 
         self.graph.record_handoff(handoff.task_id, handoff.from_agent, spec.name)
 
-        paths = self._extract_paths(output)
-        for p in paths:
-            self.graph.record_change(handoff.task_id, p)
+        intent = (
+            output.get("plan_summary")
+            or output.get("summary")
+            or output.get("notes")
+            or ""
+        )
 
+        # ---- Snippets from architect plans (file-level) -----------------
+        for fc in output.get("files_to_change", []) or []:
+            if not isinstance(fc, dict) or "path" not in fc:
+                continue
+            self.graph.record_change(handoff.task_id, fc["path"])
+            self.graph.record_snippet(
+                handoff.task_id,
+                fc["path"],
+                start=0,
+                end=0,
+                content=str(fc.get("rationale", "")),
+                intent=intent,
+                role=spec.name,
+            )
+
+        # ---- Snippets from developer/qa diffs (line-range level) --------
+        for diff in output.get("diffs", []) or []:
+            if not isinstance(diff, dict) or "path" not in diff:
+                continue
+            path = diff["path"]
+            self.graph.record_change(handoff.task_id, path)
+            for start, end, hunk in self._parse_diff_hunks(str(diff.get("unified_diff", ""))):
+                self.graph.record_snippet(
+                    handoff.task_id, path,
+                    start=start, end=end, content=hunk,
+                    intent=intent, role=spec.name,
+                )
+
+        # ---- Agent-supplied snippet/feedback annotations ----------------
+        # Agents may include `_snippets` or `_feedback` to enrich beyond what
+        # the runtime can infer from diffs alone.
+        for snip in output.pop("_snippets", []) or []:
+            if not isinstance(snip, dict):
+                continue
+            self.graph.record_snippet(
+                handoff.task_id,
+                snip.get("path", ""),
+                start=int(snip.get("start", 0)),
+                end=int(snip.get("end", 0)),
+                content=str(snip.get("content", "")),
+                intent=str(snip.get("intent", intent)),
+                role=spec.name,
+            )
+        for fb in output.pop("_feedback", []) or []:
+            if not isinstance(fb, dict) or "label" not in fb:
+                continue
+            self.graph.tag_relevance(
+                handoff.task_id,
+                str(fb["label"]),
+                score=float(fb.get("score", 1.0)),
+                reason=str(fb.get("reason", "")),
+            )
+
+        # ---- Auto-classification (change-kind labels) -------------------
+        for kind in classify_change_kinds(intent):
+            self.graph.tag_relevance(handoff.task_id, kind, reason="auto-classified")
+
+        # ---- Graphify enrichment + blast-radius PRF ---------------------
+        paths = self._extract_paths(output)
         if not paths or self.graphify is None or not self.graphify.is_ready:
             return
 
-        # Pull blast-radius from graphify and absorb the relevant symbol slice.
+        total_downstream = 0
         for path in paths:
             impact = self.graphify.impact(path)
             if impact is None:
                 continue
             self.graph.record_impact(handoff.task_id, path, impact.downstream)
+            total_downstream += len(impact.downstream)
             sub = self.graphify.subgraph_for([impact.symbol, *impact.downstream])
             if sub is not None:
                 self.graph.merge_subgraph(sub, namespace="symbol")
+
+        if total_downstream:
+            label = HIGH_BLAST_RADIUS if total_downstream >= 10 else LOW_BLAST_RADIUS
+            self.graph.tag_relevance(
+                handoff.task_id, label,
+                score=float(total_downstream),
+                reason=f"{total_downstream} downstream symbols",
+            )
+
+    @staticmethod
+    def _parse_diff_hunks(unified_diff: str) -> list[tuple[int, int, str]]:
+        """Extract `(new_start, new_end, hunk_text)` per @@ block.
+
+        We use the *new file* coordinates because agents reason about the
+        post-change layout. Returns one entry per hunk.
+        """
+        if not unified_diff:
+            return []
+        out: list[tuple[int, int, str]] = []
+        current_start: int | None = None
+        current_lines: list[str] = []
+        current_added = 0
+        for line in unified_diff.splitlines():
+            if line.startswith("@@"):
+                if current_start is not None:
+                    out.append((
+                        current_start,
+                        current_start + max(current_added - 1, 0),
+                        "\n".join(current_lines),
+                    ))
+                current_lines = []
+                current_added = 0
+                m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                current_start = int(m.group(1)) if m else 0
+                continue
+            if current_start is None:
+                continue
+            if line.startswith(("+", " ")) and not line.startswith("+++"):
+                current_lines.append(line[1:])
+                current_added += 1
+        if current_start is not None and current_lines:
+            out.append((
+                current_start,
+                current_start + max(current_added - 1, 0),
+                "\n".join(current_lines),
+            ))
+        return out
 
     @staticmethod
     def _extract_paths(output: dict[str, Any]) -> list[str]:

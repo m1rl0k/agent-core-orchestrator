@@ -32,7 +32,6 @@ from agentcore.orchestrator.traces import TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry, watch_agents_dir
 
-
 # ---------------------------------------------------------------------------
 # Wire payloads
 # ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ def build_app() -> FastAPI:
     )
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):  # noqa: ARG001
+    async def lifespan(app: FastAPI):
         stop = asyncio.Event()
         watcher = asyncio.create_task(
             watch_agents_dir(settings.agents_dir, registry, stop_event=stop)

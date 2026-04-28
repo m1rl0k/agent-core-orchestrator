@@ -42,7 +42,7 @@ class Adapter(ABC):
 
     def _shell(self, args: Sequence[str], *, timeout: float = 30.0) -> tuple[int, str, str]:
         """Run a CLI command with no shell expansion. Returns (rc, stdout, stderr)."""
-        out = subprocess.run(  # noqa: S603 - explicit args, no shell
+        out = subprocess.run(
             list(args),
             capture_output=True,
             text=True,

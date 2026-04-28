@@ -6,7 +6,6 @@ from pathlib import Path
 
 from agentcore.spec.loader import AgentRegistry
 
-
 GOOD = """\
 ---
 name: dev

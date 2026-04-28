@@ -1,60 +1,51 @@
-"""Embedding client.
+"""In-process embeddings via fastembed.
 
-Two providers, both Nomic-1.5 family:
-  - "ollama"  — POST to http://OLLAMA_HOST/api/embed (recommended for dev)
-  - "nomic"   — POST to https://api-atlas.nomic.ai/v1/embedding/text
+Defaults to Nomic-embed-text-v1.5 (768-dim). The model is small enough to
+ship inside the orchestrator process — no separate Ollama / Nomic Atlas
+server required. The first call lazily downloads weights into the
+fastembed cache; subsequent calls are local.
 
-The vector dimensionality for `nomic-embed-text:v1.5` is 768.
+If `fastembed` isn't installed (e.g. in a thin install of the package)
+`Embedder` raises on construction so the failure is clear and early.
 """
 
 from __future__ import annotations
 
-from typing import Literal
-
-import httpx
+import asyncio
+from typing import Any
 
 from agentcore.settings import Settings, get_settings
 
 EMBED_DIM = 768
+DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 
 
 class Embedder:
-    def __init__(self, settings: Settings | None = None) -> None:
+    """Thin async wrapper around fastembed's TextEmbedding."""
+
+    def __init__(self, settings: Settings | None = None, *, model: str | None = None) -> None:
+        try:
+            from fastembed import TextEmbedding
+        except Exception as exc:  # pragma: no cover - import error surfaced clearly
+            raise RuntimeError(
+                "fastembed is not installed. Install with `pip install fastembed`."
+            ) from exc
+
         self.settings = settings or get_settings()
-        self.provider: Literal["ollama", "nomic"] = self.settings.embed_provider
-        self.model = self.settings.embed_model
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self.model_name = model or self.settings.embed_model or DEFAULT_MODEL
+        self._engine: Any = TextEmbedding(model_name=self.model_name)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        # fastembed has no resources to release; defined for symmetry with
+        # any future HTTP-backed implementation.
+        return None
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        if self.provider == "ollama":
-            return await self._embed_ollama(texts)
-        return await self._embed_nomic(texts)
+        # fastembed is sync + CPU-bound. Push to a thread so we don't block
+        # the event loop.
+        return await asyncio.to_thread(self._embed_sync, texts)
 
-    async def _embed_ollama(self, texts: list[str]) -> list[list[float]]:
-        url = f"{self.settings.ollama_host.rstrip('/')}/api/embed"
-        resp = await self._client.post(url, json={"model": self.model, "input": texts})
-        resp.raise_for_status()
-        data = resp.json()
-        # Ollama returns either {"embeddings": [[...], ...]} or, for older
-        # versions, {"embedding": [...]} for a single input.
-        if "embeddings" in data:
-            return data["embeddings"]
-        return [data["embedding"]]
-
-    async def _embed_nomic(self, texts: list[str]) -> list[list[float]]:
-        if not self.settings.nomic_api_key:
-            raise RuntimeError("NOMIC_API_KEY is not set")
-        url = "https://api-atlas.nomic.ai/v1/embedding/text"
-        headers = {"Authorization": f"Bearer {self.settings.nomic_api_key}"}
-        resp = await self._client.post(
-            url,
-            headers=headers,
-            json={"model": self.model, "texts": texts, "task_type": "search_document"},
-        )
-        resp.raise_for_status()
-        return resp.json()["embeddings"]
+    def _embed_sync(self, texts: list[str]) -> list[list[float]]:
+        return [list(map(float, vec)) for vec in self._engine.embed(texts)]

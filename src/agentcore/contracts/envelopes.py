@@ -65,7 +65,7 @@ class Handoff(BaseModel):
         from_agent: str,
         payload: dict[str, Any],
         notes: str = "",
-    ) -> "Handoff":
+    ) -> Handoff:
         """Build the next-hop handoff carrying forward task_id and trace."""
         new_step = self.step + 1
         trace = Trace(

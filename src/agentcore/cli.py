@@ -16,12 +16,9 @@ from agentcore.adapters.graphify import GraphifyAdapter
 from agentcore.capabilities import detect_capabilities
 from agentcore.contracts.envelopes import Handoff, new_task_id
 from agentcore.host import detect_host, render_install_hint
+from agentcore.language import detect_languages, probe_lsps
 from agentcore.llm.router import LLMRouter
 from agentcore.logging_setup import configure_logging
-from agentcore.memory.code_index import CodeIndex
-from agentcore.memory.embed import Embedder
-from agentcore.memory.graph import KnowledgeGraph
-from agentcore.memory.vector import VectorStore
 from agentcore.orchestrator.runtime import Runtime
 from agentcore.orchestrator.traces import TraceLog
 from agentcore.settings import get_settings
@@ -37,8 +34,10 @@ console = Console()
 
 
 @app.command()
-def doctor() -> None:
-    """Show host, capability, and registry status."""
+def doctor(
+    repo: Path = typer.Option(Path("."), help="Repo to scan for languages"),
+) -> None:
+    """Show host, capability, language/LSP, and registry status."""
     settings = get_settings()
     configure_logging(settings.log_level)
     host = detect_host()
@@ -64,6 +63,25 @@ def doctor() -> None:
             detail = (cap.detail.splitlines() or [""])[0]
         cap_table.add_row(name, cap.status, detail)
     console.print(cap_table)
+
+    console.rule("[bold]languages & LSPs")
+    profile = detect_languages(repo)
+    if profile.primary is None:
+        console.print(f"[yellow]no source files detected under {repo.resolve()}[/yellow]")
+    else:
+        lang_table = Table("language", "files", "lsp", "status")
+        for lang, count in sorted(profile.counts.items(), key=lambda x: -x[1]):
+            statuses = probe_lsps([lang])
+            if not statuses:
+                lang_table.add_row(lang, str(count), "—", "no recommendation")
+                continue
+            s = statuses[0]
+            if s.available:
+                lang_table.add_row(lang, str(count), s.binary or "", "[green]ready[/green]")
+            else:
+                lang_table.add_row(lang, str(count), "[dim]none[/dim]",
+                                   f"[yellow]install[/yellow]: {s.install_hint}")
+        console.print(lang_table)
 
     console.rule("[bold]agents")
     registry = AgentRegistry()
@@ -118,6 +136,10 @@ def index(
 
 
 async def _index_async(repo: Path, collection: str, init_schema: bool, settings) -> None:  # type: ignore[no-untyped-def]
+    from agentcore.memory.code_index import CodeIndex
+    from agentcore.memory.embed import Embedder
+    from agentcore.memory.vector import VectorStore
+
     store = VectorStore(settings)
     if init_schema:
         store.init_schema()
@@ -161,6 +183,9 @@ def plan(
 
 
 async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
+    from agentcore.memory import prf
+    from agentcore.memory.graph import KnowledgeGraph
+
     settings = get_settings()
     configure_logging(settings.log_level)
 
@@ -191,16 +216,40 @@ async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
     )
     console.print(f"[bold]task {handoff.task_id}[/bold]")
 
+    final_outcome = None
     current: Handoff | None = handoff
     for _ in range(max_hops):
         if current is None:
             break
         outcome, nxt = await runtime.execute(current)
+        final_outcome = outcome
         console.rule(f"[bold]{outcome.agent}[/bold] · {outcome.status}")
         console.print_json(json.dumps(outcome.output))
         if not (chain and nxt):
             break
         current = nxt
+
+    # Chain-end PRF tagging.
+    if final_outcome is not None:
+        out = final_outcome.output
+        if final_outcome.agent == "qa":
+            failed = out.get("failed") or []
+            if failed:
+                graph.tag_relevance(handoff.task_id, prf.QA_FAILED,
+                                    score=float(len(failed)),
+                                    reason="qa returned failures")
+                graph.tag_task(handoff.task_id, prf.DEV_REVISED)
+            else:
+                graph.tag_relevance(handoff.task_id, prf.QA_PASSED)
+                graph.tag_task(handoff.task_id, prf.POSITIVE)
+        elif final_outcome.agent == "ops":
+            status = str(out.get("pipeline_status", ""))
+            if status == "passed":
+                graph.tag_task(handoff.task_id, prf.SHIPPED)
+            elif status == "failed":
+                graph.tag_task(handoff.task_id, prf.OPS_BLOCKED)
+
+    graph.save()
 
 
 # ---------------------------------------------------------------------------

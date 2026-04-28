@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from agentcore.contracts.domain import ContextBundle, ContextRef
 from agentcore.memory.embed import Embedder
 from agentcore.memory.graph import KnowledgeGraph
+from agentcore.memory.rerank import Reranker
 from agentcore.memory.vector import Hit, VectorStore
 
 
@@ -25,20 +26,34 @@ class RetrievalResult:
 
 
 class HybridRetriever:
+    """Vector + graph + (optional) cross-encoder reranker.
+
+    Pipeline:
+      1. Embed query, top-k from each requested vector collection.
+      2. Add a graph-proximity bonus when two hits are 1-hop neighbours in
+         the operational/code knowledge graph.
+      3. (optional) Rerank the merged candidate set with a tiny
+         cross-encoder (mxbai by default).
+    """
+
     def __init__(
         self,
         embedder: Embedder,
         vector: VectorStore,
         graph: KnowledgeGraph | None = None,
+        reranker: Reranker | None = None,
         *,
         alpha: float = 0.7,
         beta: float = 0.3,
+        gamma: float = 1.0,
     ) -> None:
         self.embedder = embedder
         self.vector = vector
         self.graph = graph
+        self.reranker = reranker
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
 
     async def retrieve(
         self, query: str, collections: list[str], k: int = 8
@@ -48,6 +63,7 @@ class HybridRetriever:
         for col in collections:
             all_hits.extend(self.vector.search(col, emb, k=k))
 
+        # Vector + graph score.
         scored: list[tuple[Hit, float]] = []
         for hit in all_hits:
             graph_bonus = 0.0
@@ -55,8 +71,16 @@ class HybridRetriever:
                 neighbors = set(self.graph.neighbors(hit.ref, hops=1))
                 if neighbors & {h.ref for h in all_hits}:
                     graph_bonus = 1.0
-            score = self.alpha * hit.score + self.beta * graph_bonus
-            scored.append((hit, score))
+            scored.append((hit, self.alpha * hit.score + self.beta * graph_bonus))
+
+        # Optional cross-encoder rerank on the merged candidate set.
+        if self.reranker and scored:
+            docs = [h.content for h, _ in scored]
+            rerank_scores = await self.reranker.score(query, docs)
+            scored = [
+                (h, base + self.gamma * rs)
+                for (h, base), rs in zip(scored, rerank_scores, strict=True)
+            ]
 
         scored.sort(key=lambda x: x[1], reverse=True)
         top = scored[:k]
@@ -70,7 +94,9 @@ class HybridRetriever:
             for hit, score in top
         ]
         summary = (
-            f"{len(top)} relevant chunks across {len(collections)} collection(s)."
+            f"{len(top)} relevant chunks across {len(collections)} collection(s)"
+            + (" (reranked)" if self.reranker else "")
+            + "."
             if top else "No relevant context found."
         )
         return RetrievalResult(

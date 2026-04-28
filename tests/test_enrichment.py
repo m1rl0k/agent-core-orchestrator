@@ -8,13 +8,12 @@ import pytest
 
 from agentcore.adapters.graphify import GraphifyAdapter, SymbolImpact
 from agentcore.contracts.envelopes import Handoff
-from agentcore.llm.router import ChatMessage, LLMResponse, LLMRouter
+from agentcore.llm.router import LLMResponse, LLMRouter
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.runtime import Runtime
 from agentcore.orchestrator.traces import TraceLog
 from agentcore.spec.loader import AgentRegistry
 from agentcore.spec.parser import parse_agent_text
-
 
 ARCHITECT = """\
 ---
@@ -91,7 +90,7 @@ async def test_enrichment_writes_handoff_changes_and_impact() -> None:
     registry = AgentRegistry()
     registry.upsert(parse_agent_text(ARCHITECT, source="architect.agent.md"))
 
-    graph = KnowledgeGraph(snapshot_path="/tmp/agentcore-test-graph.json")  # noqa: S108
+    graph = KnowledgeGraph(snapshot_path="/tmp/agentcore-test-graph.json")
     runtime = Runtime(
         registry=registry,
         router=FakeRouter(),

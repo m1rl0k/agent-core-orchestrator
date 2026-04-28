@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import community as community_louvain  # python-louvain
 import networkx as nx
 
 
@@ -99,7 +98,93 @@ class KnowledgeGraph:
             self.add_edge(f, s, weight=0.5, relation="contains")
             self.add_edge(t, s, weight=0.5, relation="blast_radius")
 
-    def merge_subgraph(self, other: "nx.Graph", *, namespace: str = "symbol") -> int:
+    def record_snippet(
+        self,
+        task_id: str,
+        file_path: str,
+        *,
+        start: int,
+        end: int,
+        content: str,
+        intent: str = "",
+        role: str = "",
+    ) -> str:
+        """Persist a code snippet produced/touched by a task.
+
+        Used by the enrichment hook to capture exactly what changed and the
+        agent's stated intent. Snippets start as `relevance="pending"` and
+        get stamped by `tag_relevance` when the chain completes.
+        """
+        node = f"snippet:{file_path}:{start}-{end}#{task_id}"
+        self.add_node(
+            node,
+            kind="snippet",
+            file=file_path,
+            start=start,
+            end=end,
+            content=content[:4000],
+            intent=intent,
+            role=role,
+            relevance="pending",
+        )
+        t = f"task:{task_id}"
+        f = f"file:{file_path}"
+        self.add_node(t, kind="task")
+        self.add_node(f, kind="file")
+        self.add_edge(t, node, weight=1.0, relation="produced")
+        self.add_edge(f, node, weight=1.0, relation="contains_snippet")
+        return node
+
+    def tag_relevance(
+        self, task_id: str, label: str, *, score: float = 1.0, reason: str = ""
+    ) -> int:
+        """Append a PRF label to every snippet a task produced.
+
+        Labels accumulate; later events refine the picture. See
+        `agentcore.memory.prf` for the canonical taxonomy
+        (positive, qa_passed, qa_failed, ops_blocked, shipped, abandoned,
+        signal_resolved, signal_recurring, low/high_blast_radius, kind:*).
+        """
+        from agentcore.memory.prf import now as _now
+
+        t = f"task:{task_id}"
+        if t not in self.g:
+            return 0
+        tagged = 0
+        record = {"score": float(score), "reason": reason, "at": _now()}
+        for n in list(self.g.neighbors(t)):
+            attrs = self.g.nodes[n]
+            if attrs.get("kind") != "snippet":
+                continue
+            labels: dict = attrs.setdefault("labels", {})
+            labels[label] = record
+            tagged += 1
+        return tagged
+
+    def tag_task(
+        self, task_id: str, label: str, *, score: float = 1.0, reason: str = ""
+    ) -> None:
+        """Tag a task node directly (independent of its snippets)."""
+        from agentcore.memory.prf import now as _now
+
+        t = f"task:{task_id}"
+        if t not in self.g:
+            return
+        labels: dict = self.g.nodes[t].setdefault("labels", {})
+        labels[label] = {"score": float(score), "reason": reason, "at": _now()}
+
+    def snippets_for(self, task_id: str) -> list[dict[str, Any]]:
+        t = f"task:{task_id}"
+        if t not in self.g:
+            return []
+        out: list[dict[str, Any]] = []
+        for n in self.g.neighbors(t):
+            attrs = self.g.nodes[n]
+            if attrs.get("kind") == "snippet":
+                out.append({"id": n, **attrs})
+        return out
+
+    def merge_subgraph(self, other: nx.Graph, *, namespace: str = "symbol") -> int:
         """Compose another NetworkX graph into ours, namespacing its nodes.
 
         Returns the number of nodes added. Used by the enrichment hook to
@@ -126,6 +211,13 @@ class KnowledgeGraph:
         if self.g.number_of_nodes() == 0:
             self._communities = {}
             return {}
+        try:
+            import community as community_louvain  # python-louvain
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "python-louvain is required for community detection; "
+                "install with `pip install python-louvain`"
+            ) from exc
         self._communities = community_louvain.best_partition(
             self.g, weight="weight", resolution=resolution
         )

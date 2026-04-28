@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    name: lint + test (py${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install (light deps for tests)
+        # Heavy native deps (psycopg, fastembed weights, graphifyy) are not
+        # required for the unit tests — they're loaded lazily.
+        run: |
+          uv pip install --system \
+            'pydantic>=2.6' 'pydantic-settings>=2.2' \
+            python-frontmatter pyyaml watchfiles structlog \
+            httpx networkx \
+            'fastapi>=0.110' 'typer>=0.12' 'rich>=13.7' \
+            'pytest>=8.0' 'pytest-asyncio>=0.23' \
+            'ruff>=0.4'
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Tests
+        env:
+          PYTHONPATH: src
+        run: pytest -q
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build orchestrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: agentcore-orchestrator:ci
+      - name: Smoke test the image
+        run: |
+          docker run --rm \
+            -e ANTHROPIC_API_KEY=dummy \
+            agentcore-orchestrator:ci \
+            python -c "from agentcore.orchestrator.app import build_app; build_app()"

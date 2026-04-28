@@ -8,7 +8,6 @@ import pytest
 
 from agentcore.spec.parser import SpecParseError, parse_agent_text
 
-
 VALID = textwrap.dedent(
     """\
     ---

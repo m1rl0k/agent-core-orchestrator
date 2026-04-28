@@ -37,11 +37,16 @@ class Settings(BaseSettings):
             f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
         )
 
-    # Embeddings
-    embed_provider: Literal["ollama", "nomic"] = Field("ollama", alias="AGENTCORE_EMBED_PROVIDER")
-    embed_model: str = Field("nomic-embed-text:v1.5", alias="AGENTCORE_EMBED_MODEL")
-    ollama_host: str = Field("http://localhost:11434", alias="OLLAMA_HOST")
-    nomic_api_key: str | None = Field(None, alias="NOMIC_API_KEY")
+    # Embeddings (in-process via fastembed; Nomic-1.5 default).
+    embed_model: str = Field(
+        "nomic-ai/nomic-embed-text-v1.5", alias="AGENTCORE_EMBED_MODEL"
+    )
+
+    # Reranking (optional; tiny MixedBread cross-encoder via fastembed).
+    enable_rerank: bool = Field(True, alias="AGENTCORE_ENABLE_RERANK")
+    rerank_model: str = Field(
+        "mixedbread-ai/mxbai-rerank-xsmall-v1", alias="AGENTCORE_RERANK_MODEL"
+    )
 
     # LLM providers
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")

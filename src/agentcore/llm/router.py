@@ -74,10 +74,9 @@ def _split_system(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]
 async def _call_anthropic(
     messages: list[ChatMessage], cfg: ModelConfig, settings: Settings
 ) -> LLMResponse:
-    from anthropic import AsyncAnthropic
-
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
+    from anthropic import AsyncAnthropic
 
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     system, rest = _split_system(messages)
@@ -137,10 +136,9 @@ async def _call_bedrock(
 async def _call_azure_openai(
     messages: list[ChatMessage], cfg: ModelConfig, settings: Settings
 ) -> LLMResponse:
-    from openai import AsyncAzureOpenAI
-
     if not (settings.azure_openai_api_key and settings.azure_openai_endpoint):
         raise RuntimeError("AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set")
+    from openai import AsyncAzureOpenAI
 
     client = AsyncAzureOpenAI(
         api_key=settings.azure_openai_api_key,
@@ -165,10 +163,9 @@ async def _call_azure_openai(
 async def _call_zai(
     messages: list[ChatMessage], cfg: ModelConfig, settings: Settings
 ) -> LLMResponse:
-    from openai import AsyncOpenAI
-
     if not settings.zai_api_key:
         raise RuntimeError("ZAI_API_KEY is not set")
+    from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.zai_api_key, base_url=settings.zai_base_url)
     resp = await client.chat.completions.create(

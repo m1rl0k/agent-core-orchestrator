@@ -16,15 +16,6 @@ services:
       timeout: 3s
       retries: 10
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: agentcore-ollama
-    profiles: ["local-embed"]
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-
   orchestrator:
     build: .
     container_name: agentcore-orchestrator
@@ -41,4 +32,3 @@ services:
 
 volumes:
   pgdata:
-  ollama:
