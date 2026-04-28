@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agentcore-postgres
+    environment:
+      POSTGRES_USER: ${PGUSER:-agentcore}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-agentcore}
+      POSTGRES_DB: ${PGDATABASE:-agentcore}
+    ports:
+      - "${PGPORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-agentcore}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agentcore-ollama
+    profiles: ["local-embed"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  orchestrator:
+    build: .
+    container_name: agentcore-orchestrator
+    profiles: ["serve"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "${AGENTCORE_PORT:-8088}:8088"
+    volumes:
+      - ./agents:/app/agents:ro
+      - ./.agentcore:/app/.agentcore
+
+volumes:
+  pgdata:
+  ollama:
