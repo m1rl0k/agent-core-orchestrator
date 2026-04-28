@@ -31,6 +31,7 @@ from agentcore.contracts.envelopes import (
 from agentcore.llm.router import ChatMessage, LLMRouter
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
+from agentcore.retrieval.hybrid import HybridRetriever
 from agentcore.spec.loader import AgentRegistry
 from agentcore.spec.models import AgentSpec, Contract
 
@@ -50,12 +51,14 @@ class Runtime:
         *,
         graph: KnowledgeGraph | None = None,
         graphify: GraphifyAdapter | None = None,
+        retriever: HybridRetriever | None = None,
     ) -> None:
         self.registry = registry
         self.router = router
         self.traces = traces or TraceLog()
         self.graph = graph
         self.graphify = graphify
+        self.retriever = retriever
 
     async def execute(self, handoff: Handoff) -> tuple[Outcome, Handoff | None]:
         spec = self.registry.get(handoff.to_agent)
@@ -82,7 +85,7 @@ class Runtime:
             raise
 
         # 3. LLM call
-        messages = self._render_messages(spec, handoff)
+        messages = await self._render_messages(spec, handoff)
         self._record(handoff.task_id, handoff.step, "llm_call", spec.name,
                      {"provider": spec.llm.provider, "model": spec.llm.model})
         resp = await self.router.complete(messages, spec.llm)
@@ -289,7 +292,9 @@ class Runtime:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _render_messages(self, spec: AgentSpec, handoff: Handoff) -> list[ChatMessage]:
+    async def _render_messages(
+        self, spec: AgentSpec, handoff: Handoff
+    ) -> list[ChatMessage]:
         schema = self._json_schema_hint(spec.contract)
         soul = (
             f"You are the {spec.soul.role}. Voice: {spec.soul.voice}. "
@@ -297,11 +302,13 @@ class Runtime:
             f"Forbidden: {', '.join(spec.soul.forbidden) or 'n/a'}."
         )
         system = f"{spec.system_prompt}\n\n{soul}\n\n{schema}".strip()
+        context_block = await self._build_context_block(spec, handoff)
         user = (
             f"Inbound handoff from `{handoff.from_agent}` (task {handoff.task_id}, "
             f"step {handoff.step}).\n\n"
             f"Payload (validated against your inputs):\n```json\n"
-            f"{json.dumps(handoff.payload, indent=2)}\n```\n\n"
+            f"{json.dumps(handoff.payload, indent=2)}\n```\n"
+            f"{context_block}\n"
             "Respond with a single JSON object matching the OUTPUT schema. "
             "Do not include any prose outside the JSON."
         )
@@ -309,6 +316,105 @@ class Runtime:
             ChatMessage(role="system", content=system),
             ChatMessage(role="user", content=user),
         ]
+
+    async def _build_context_block(
+        self, spec: AgentSpec, handoff: Handoff
+    ) -> str:
+        """Assemble the per-hop dynamic context block.
+
+        Three sources, each independent (any can fail without aborting):
+          1. Hybrid RAG (vector + graph + reranker) over the agent's
+             declared `knowledge.rag_collections`.
+          2. Operational memory: prior tasks that touched the same files,
+             aggregated PRF labels, co-changed neighbours.
+          3. graphify symbol context for files mentioned in the payload.
+        """
+        sections: list[str] = []
+        query = self._compose_query(handoff)
+        files = self._files_in_payload(handoff.payload)
+
+        # ---- 1. Retrieval ----
+        if self.retriever and spec.knowledge.rag_collections and query:
+            try:
+                result = await self.retriever.retrieve(
+                    query, spec.knowledge.rag_collections, k=6
+                )
+                if result.bundle.refs:
+                    lines = ["== Retrieved context (semantic) =="]
+                    lines.append(result.bundle.summary)
+                    for ref in result.bundle.refs:
+                        lines.append(
+                            f"- {ref.id}  (score {ref.score:.2f})\n"
+                            f"  ```\n  {ref.excerpt}\n  ```"
+                        )
+                    sections.append("\n".join(lines))
+            except Exception as exc:
+                log.warning("retrieval_failed", agent=spec.name, error=str(exc))
+
+        # ---- 2. Operational memory ----
+        if self.graph is not None and files:
+            mem = self.graph.operational_memory(files)
+            if mem["tasks"] or mem["label_counts"] or mem["neighbors"]:
+                lines = ["== Operational memory (team & task history) =="]
+                if mem["tasks"]:
+                    lines.append("Recent tasks touching these files:")
+                    for t in mem["tasks"]:
+                        labels = ", ".join(t["labels"]) or "no labels"
+                        lines.append(f"- {t['id']}  [{labels}]")
+                if mem["label_counts"]:
+                    lines.append(
+                        "Aggregate PRF labels in this area: "
+                        + ", ".join(f"{k}×{v}" for k, v in mem["label_counts"].items())
+                    )
+                if mem["neighbors"]:
+                    lines.append(
+                        "Co-changed files (likely related): "
+                        + ", ".join(mem["neighbors"])
+                    )
+                sections.append("\n".join(lines))
+
+        # ---- 3. Graphify symbol context ----
+        if self.graphify is not None and self.graphify.is_ready and files:
+            lines = ["== Code-graph context (graphify) =="]
+            for path in files[:5]:
+                impact = self.graphify.impact(path)
+                if impact is None:
+                    continue
+                lines.append(
+                    f"- {path}: blast radius {len(impact.downstream)} "
+                    f"(confidence {impact.confidence:.2f})"
+                )
+                if impact.downstream:
+                    lines.append("    downstream: " + ", ".join(impact.downstream[:8]))
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        if not sections:
+            return ""
+        return "\n\n" + "\n\n".join(sections) + "\n"
+
+    @staticmethod
+    def _compose_query(handoff: Handoff) -> str:
+        """Cheap natural-language query from common payload shapes."""
+        p = handoff.payload
+        for key in ("brief", "summary", "plan_summary", "notes", "suite_summary"):
+            value = p.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+
+    @staticmethod
+    def _files_in_payload(payload: dict[str, Any]) -> list[str]:
+        out: list[str] = []
+        for key in ("files_to_change", "diffs"):
+            entries = payload.get(key)
+            if not isinstance(entries, list):
+                continue
+            for item in entries:
+                if isinstance(item, dict) and "path" in item:
+                    out.append(str(item["path"]))
+        seen: set[str] = set()
+        return [p for p in out if not (p in seen or seen.add(p))]
 
     @staticmethod
     def _json_schema_hint(contract: Contract) -> str:

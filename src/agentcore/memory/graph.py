@@ -173,6 +173,61 @@ class KnowledgeGraph:
         labels: dict = self.g.nodes[t].setdefault("labels", {})
         labels[label] = {"score": float(score), "reason": reason, "at": _now()}
 
+    def operational_memory(
+        self, file_paths: list[str], *, k: int = 5
+    ) -> dict[str, Any]:
+        """Recent task history relevant to a set of file paths.
+
+        Returns the k most-recently-changed prior tasks that touched any of
+        the given files, plus aggregated PRF labels. Used by the runtime to
+        prepend "operational memory" to each agent's prompt.
+        """
+        if not file_paths:
+            return {"tasks": [], "label_counts": {}, "neighbors": []}
+
+        task_hits: list[tuple[str, dict[str, Any]]] = []
+        seen_tasks: set[str] = set()
+        for fp in file_paths:
+            f = f"file:{fp}"
+            if f not in self.g:
+                continue
+            for n in self.g.neighbors(f):
+                attrs = self.g.nodes[n]
+                if attrs.get("kind") == "task" and n not in seen_tasks:
+                    seen_tasks.add(n)
+                    task_hits.append((n, attrs))
+
+        # Sort by tagged labels' "at" if available; otherwise stable order.
+        def _last_seen(attrs: dict[str, Any]) -> str:
+            labels = attrs.get("labels", {}) or {}
+            return max((rec.get("at", "") for rec in labels.values()), default="")
+
+        task_hits.sort(key=lambda x: _last_seen(x[1]), reverse=True)
+        top = task_hits[:k]
+
+        label_counts: dict[str, int] = {}
+        tasks_summary = []
+        for tid, attrs in top:
+            tasks_summary.append({
+                "id": tid,
+                "labels": list((attrs.get("labels") or {}).keys()),
+            })
+            for label in attrs.get("labels") or {}:
+                label_counts[label] = label_counts.get(label, 0) + 1
+
+        # Co-changed files (1-hop neighbours of the input set, minus inputs).
+        neighbour_files: set[str] = set()
+        for tid, _ in top:
+            for n in self.g.neighbors(tid):
+                if n.startswith("file:") and n[len("file:"):] not in file_paths:
+                    neighbour_files.add(n[len("file:"):])
+
+        return {
+            "tasks": tasks_summary,
+            "label_counts": label_counts,
+            "neighbors": sorted(neighbour_files)[:10],
+        }
+
     def snippets_for(self, task_id: str) -> list[dict[str, Any]]:
         t = f"task:{task_id}"
         if t not in self.g:

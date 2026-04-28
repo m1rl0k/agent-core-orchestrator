@@ -149,6 +149,14 @@ async def _index_async(repo: Path, collection: str, init_schema: bool, settings)
     if not symbols:
         return
 
+    # Auto-warm: first call would otherwise silently download weights.
+    from agentcore.models import pull_embedder
+
+    pull = pull_embedder(settings)
+    if not pull.ok:
+        console.print(f"[red]embedder unavailable: {pull.detail}[/red]")
+        raise typer.Exit(code=1)
+
     embedder = Embedder(settings)
     try:
         # Batch in groups of 64 to keep payloads reasonable.
@@ -204,8 +212,12 @@ async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
         if settings.enable_graphify
         else None
     )
+    # Best-effort retriever: only if pgvector + fastembed are usable.
+    retriever = _try_build_retriever(settings, graph)
+
     runtime = Runtime(
-        registry=registry, router=router, traces=traces, graph=graph, graphify=graphify
+        registry=registry, router=router, traces=traces,
+        graph=graph, graphify=graphify, retriever=retriever,
     )
 
     handoff = Handoff(
@@ -278,6 +290,45 @@ def serve(
 # ---------------------------------------------------------------------------
 
 
+models_app = typer.Typer(help="Manage local model weights (embedder + reranker)")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("pull")
+def models_pull(
+    embedder: bool = typer.Option(True, help="Pull the embedder (Nomic-1.5)"),
+    reranker: bool = typer.Option(True, help="Pull the cross-encoder reranker"),
+) -> None:
+    """Download and warm fastembed models so first inference is instant.
+
+    Safe to run on host or inside the Docker image (it's invoked during
+    image build to ship weights pre-cached).
+    """
+    from agentcore.models import pull_embedder, pull_reranker
+
+    settings = get_settings()
+    results = []
+    if embedder:
+        console.print("[bold]pulling embedder…[/bold]")
+        results.append(pull_embedder(settings))
+    if reranker:
+        console.print("[bold]pulling reranker…[/bold]")
+        results.append(pull_reranker(settings))
+
+    table = Table("kind", "name", "status", "detail")
+    any_failed = False
+    for r in results:
+        if r.ok:
+            status = "[green]ready[/green]" if r.cached else "[green]downloaded[/green]"
+        else:
+            status = "[red]failed[/red]"
+            any_failed = True
+        table.add_row(r.kind, r.name, status, r.detail or "")
+    console.print(table)
+    if any_failed:
+        raise typer.Exit(code=1)
+
+
 link_app = typer.Typer(help="Link agentcore into other tools")
 app.add_typer(link_app, name="link")
 
@@ -301,6 +352,47 @@ def link_claude(
     console.print(f"skipped:  {result.skipped or '(none)'}")
     if result.settings_written:
         console.print("[green]wrote[/green] .claude/settings.json hooks")
+
+
+def _try_build_retriever(settings, graph):  # type: ignore[no-untyped-def]
+    """Construct a HybridRetriever only if its deps are usable on this host.
+
+    The retriever is intentionally optional: agents still get prompts and
+    operational-memory context without it. We never block a `plan` run on
+    embedding/postgres availability.
+    """
+    try:
+        from agentcore.memory.embed import Embedder
+        from agentcore.memory.vector import VectorStore
+        from agentcore.retrieval.hybrid import HybridRetriever
+
+        store = VectorStore(settings)
+        # Light probe: does the table exist?
+        try:
+            store.init_schema()
+        except Exception as exc:
+            console.print(f"[yellow]retriever offline (no pgvector): {exc}[/yellow]")
+            return None
+
+        try:
+            embedder = Embedder(settings)
+        except Exception as exc:
+            console.print(f"[yellow]retriever offline (no embedder): {exc}[/yellow]")
+            return None
+
+        reranker = None
+        if settings.enable_rerank:
+            try:
+                from agentcore.memory.rerank import Reranker
+
+                reranker = Reranker(settings)
+            except Exception:
+                reranker = None  # rerank is a nice-to-have
+
+        return HybridRetriever(embedder, store, graph=graph, reranker=reranker)
+    except Exception as exc:
+        console.print(f"[yellow]retriever offline: {exc}[/yellow]")
+        return None
 
 
 if __name__ == "__main__":  # pragma: no cover

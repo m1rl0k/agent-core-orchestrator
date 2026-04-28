@@ -24,11 +24,17 @@ services:
       postgres:
         condition: service_healthy
     env_file: .env
+    environment:
+      FASTEMBED_CACHE_DIR: /cache/fastembed
     ports:
       - "${AGENTCORE_PORT:-8088}:8088"
     volumes:
       - ./agents:/app/agents:ro
       - ./.agentcore:/app/.agentcore
+      # Share the fastembed cache with the host so weights downloaded
+      # during build / first-run aren't paid for twice.
+      - fastembed-cache:/cache/fastembed
 
 volumes:
   pgdata:
+  fastembed-cache:

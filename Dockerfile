@@ -21,5 +21,13 @@ COPY agents ./agents
 RUN pip install --upgrade pip \
  && pip install .
 
+# Pre-pull embedder + reranker weights into the image so the container
+# doesn't go silent on first inference. Cache lives under
+# /root/.cache/fastembed by default; bind-mount /cache via compose to
+# share with the host.
+ENV FASTEMBED_CACHE_DIR=/root/.cache/fastembed
+RUN agentcore models pull --embedder --reranker || \
+    echo "model pre-pull skipped (will lazy-download on first use)"
+
 EXPOSE 8088
 CMD ["uvicorn", "agentcore.orchestrator.app:app", "--host", "0.0.0.0", "--port", "8088"]

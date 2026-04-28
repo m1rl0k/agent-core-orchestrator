@@ -77,8 +77,10 @@ def build_app() -> FastAPI:
         if settings.enable_graphify
         else None
     )
+    retriever = _try_build_retriever(settings, graph)
     runtime = Runtime(
-        registry=registry, router=router, traces=traces, graph=graph, graphify=graphify
+        registry=registry, router=router, traces=traces,
+        graph=graph, graphify=graphify, retriever=retriever,
     )
 
     @asynccontextmanager
@@ -202,6 +204,41 @@ def build_app() -> FastAPI:
         }
 
     return app
+
+
+def _try_build_retriever(settings, graph):  # type: ignore[no-untyped-def]
+    """Construct a HybridRetriever only if its deps are usable.
+
+    The orchestrator stays up even if pgvector / fastembed aren't available;
+    agents simply get prompts without the semantic-retrieval section.
+    """
+    try:
+        from agentcore.memory.embed import Embedder
+        from agentcore.memory.vector import VectorStore
+        from agentcore.retrieval.hybrid import HybridRetriever
+
+        store = VectorStore(settings)
+        try:
+            store.init_schema()
+        except Exception:
+            return None
+        try:
+            embedder = Embedder(settings)
+        except Exception:
+            return None
+
+        reranker = None
+        if settings.enable_rerank:
+            try:
+                from agentcore.memory.rerank import Reranker
+
+                reranker = Reranker(settings)
+            except Exception:
+                reranker = None
+
+        return HybridRetriever(embedder, store, graph=graph, reranker=reranker)
+    except Exception:
+        return None
 
 
 app = build_app()
