@@ -38,7 +38,7 @@ from agentcore.language import detect_languages, probe_lsps
 from agentcore.llm.router import ChatMessage, LLMRouter
 from agentcore.logging_setup import configure_logging
 from agentcore.orchestrator.runtime import Runtime
-from agentcore.orchestrator.traces import TraceLog
+from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry
 
@@ -422,7 +422,10 @@ async def _plan_async_body(
         raise typer.Exit(code=1)
 
     router = LLMRouter(settings)
-    traces = TraceLog()
+    # Mirror trace events to ~/.agentcore/traces/<chain-id>.jsonl so the
+    # `agentcore tail <chain-id>` command can follow CLI-driven chains
+    # without the orchestrator needing to be running.
+    traces = TraceLog(disk_dir=Path.home() / ".agentcore" / "traces")
 
     graph = KnowledgeGraph(settings=settings)
     try:
@@ -463,11 +466,26 @@ async def _plan_async_body(
         while True:
             verdicts = await _run_review_round(router, registry, state)
             console.rule(f"[bold]review round {loop_idx + 1}[/bold]")
+            traces.record(TraceEvent(
+                task_id=task_id, step=loop_idx + 1, kind="review_round",
+                actor="cli",
+                detail={"round": loop_idx + 1, "verdicts": len(verdicts)},
+            ))
             for v in verdicts:
                 badge = "[green]approved[/green]" if v["approved"] else "[red]rejected[/red]"
                 console.print(f"  {v['agent']:10s} {badge}  {v.get('comments', '')[:80]}")
                 for b in v.get("blockers", [])[:3]:
                     console.print(f"      ✗ {b}")
+                traces.record(TraceEvent(
+                    task_id=task_id, step=loop_idx + 1, kind="verdict",
+                    actor=v.get("agent", "?"),
+                    detail={
+                        "approved": v.get("approved", False),
+                        "comments": (v.get("comments") or "")[:200],
+                        "blockers": v.get("blockers", [])[:5],
+                        "route_back_to": v.get("route_back_to"),
+                    },
+                ))
             if all(v["approved"] for v in verdicts):
                 console.print("[bold green]all roles approved[/bold green]")
                 break
@@ -480,11 +498,6 @@ async def _plan_async_body(
                 break
             blockers = [b for v in verdicts if not v["approved"] for b in v.get("blockers", [])]
             # Continuous improvement loop: any role can take the re-review.
-            # The reviewer's `route_back_to` picks the role best able to
-            # address the blockers (architect for plan-level, developer
-            # for patch-level, qa for test gaps, ops for ship-readiness).
-            # We synthesize the right input payload from existing state
-            # so the target's contract is satisfied.
             target = next(
                 (v.get("route_back_to", "architect") for v in verdicts if not v["approved"]),
                 "architect",
@@ -493,6 +506,11 @@ async def _plan_async_body(
                 f"[yellow]routing back to {target}[/yellow] with "
                 f"{len(blockers)} blocker(s)"
             )
+            traces.record(TraceEvent(
+                task_id=task_id, step=loop_idx + 1, kind="route_back",
+                actor="cli",
+                detail={"target": target, "blockers": len(blockers)},
+            ))
             payload = _synthesize_handoff_payload(target, state, blockers, brief)
             state, task_id = await _run_chain(
                 runtime,
@@ -501,6 +519,7 @@ async def _plan_async_body(
                 max_hops,
                 start_at=target,
                 payload=payload,
+                task_id=task_id,
             )
             loop_idx += 1
 
@@ -512,12 +531,20 @@ async def _plan_async_body(
             console.print(f"[green]applied {len(applied)} file(s):[/green] " + ", ".join(applied))
         else:
             console.print("[yellow]no diffs applied[/yellow]")
+        traces.record(TraceEvent(
+            task_id=task_id, step=99, kind="applied", actor="cli",
+            detail={"count": len(applied), "files": applied[:20]},
+        ))
 
     pr_url: str | None = None
     if pr and applied:
         pr_url = _open_github_pr(repo, brief, state, task_id)
         if pr_url:
             console.print(f"[green]PR opened:[/green] {pr_url}")
+        traces.record(TraceEvent(
+            task_id=task_id, step=99, kind="pr_opened", actor="cli",
+            detail={"url": pr_url or "<none>"},
+        ))
 
     # Chain-end PRF tagging.
     if state.get("qa_output") is not None:
@@ -532,6 +559,58 @@ async def _plan_async_body(
             graph.tag_task(task_id, prf.POSITIVE)
 
     graph.save()
+
+    # Final result trace — gives `agentcore tail` a clean terminal
+    # event so it stops following confidently regardless of in-process
+    # vs over-HTTP execution.
+    approved = (
+        all(v.get("approved") for v in verdicts) if verdicts else None
+    )
+    traces.record(TraceEvent(
+        task_id=task_id, step=99, kind="result", actor="cli",
+        detail={
+            "approved": approved,
+            "applied_count": len(applied),
+            "applied": applied[:20],
+            "pr_url": pr_url,
+        },
+    ))
+
+    # End-of-run summary so the operator gets a single scannable
+    # outcome line with the chain id (for tailing / re-checking) and
+    # the bottom-line outcome. Suppressed in --json mode.
+    if not as_json:
+        if approved is True and applied:
+            tone, headline = "green", f"approved · applied {len(applied)} file(s)"
+        elif approved is True:
+            tone, headline = "yellow", "approved · no diffs to apply"
+        elif approved is False:
+            tone, headline = (
+                "yellow", "blocked by review · diffs not applied",
+            )
+        else:
+            tone, headline = "cyan", "chain finished"
+        body_lines = [
+            f"[bold {tone}]{headline}[/bold {tone}]",
+            f"[dim]chain[/dim] [bold]{task_id}[/bold]",
+        ]
+        if applied:
+            body_lines.append(
+                f"[dim]applied[/dim] {', '.join(applied)}"
+            )
+        if pr_url:
+            body_lines.append(f"[dim]pr[/dim] {pr_url}")
+        body_lines.append(
+            f"[dim]inspect:[/dim] [bold]agentcore tail {task_id}[/bold]"
+        )
+        console.print(
+            Panel(
+                "\n".join(body_lines),
+                title="agentcore · result",
+                border_style=tone,
+                padding=(0, 1),
+            )
+        )
 
     # JSON mode: emit a single structured object to stdout. The outer
     # `_plan_async` wrapper handles console.quiet restore in its
@@ -568,6 +647,7 @@ async def _run_chain(
     *,
     start_at: str = "architect",
     payload: dict | None = None,
+    task_id: str | None = None,
 ) -> tuple[dict, str]:
     """Drive the role mesh from `start_at`. Captures each role's output by name.
 
@@ -588,17 +668,21 @@ async def _run_chain(
     accepts = list(getattr(spec.contract, "accepts_handoff_from", [])) if spec else []
     from_agent = "user" if "user" in accepts or not accepts else accepts[0]
     handoff = Handoff(
-        task_id=new_task_id(),
+        task_id=task_id or new_task_id(),
         from_agent=from_agent,
         to_agent=start_at,
         payload=payload if payload is not None else {"brief": brief},
     )
+    # Up-front banner — shows the chain id prominently so the operator
+    # can tail it from another shell, plus the brief and entry role.
     console.print(
         Panel(
-            f"[bold cyan]task[/bold cyan] {handoff.task_id}\n"
+            f"[bold cyan]chain[/bold cyan]  [bold]{handoff.task_id}[/bold]\n"
+            f"[dim]follow:[/dim] [bold]agentcore tail {handoff.task_id}[/bold]\n"
             f"[bold cyan]brief[/bold cyan]\n{brief}",
             title=f"agentcore · starting at [bold]{start_at}[/bold]",
             border_style="cyan",
+            padding=(0, 1),
         )
     )
     state: dict = {}
@@ -922,10 +1006,19 @@ def tail(
 ) -> None:
     """Stream trace events for an in-flight chain in real time.
 
-    Polls the orchestrator's `/chains/{id}` and `/tasks/{id}/trace`
-    endpoints, prints each new event with the same colour scheme as
-    the `plan` command, and exits when the chain reaches a terminal
-    status (done / failed / cancelled).
+    Tries two sources, in order:
+
+      1. The orchestrator's HTTP API (`/tasks/{id}/trace` +
+         `/chains/{id}`) — works for chains submitted via `POST /run`
+         to a running `agentcore serve`.
+      2. The local on-disk trace at `~/.agentcore/traces/{id}.jsonl` —
+         written by the CLI's in-process runs (`agentcore plan`). This
+         lets you tail a CLI run from another shell without the
+         orchestrator running.
+
+    Exits when the chain reaches a terminal status, or when the JSONL
+    trace stops growing for `--interval × 5` and the last event was
+    an outcome.
     """
     import time
 
@@ -937,17 +1030,27 @@ def tail(
     if settings.api_token:
         headers["Authorization"] = f"Bearer {settings.api_token}"
 
+    local_path = Path.home() / ".agentcore" / "traces" / f"{chain_id}.jsonl"
+    have_local = local_path.exists()
+
     console.print(
         Panel(
             f"[bold cyan]chain[/bold cyan] {chain_id}\n"
-            f"[bold cyan]url[/bold cyan]   {base}",
+            f"[bold cyan]source[/bold cyan] "
+            + (f"local file [dim]({local_path})[/dim]"
+               if have_local else f"http {base}"),
             title="agentcore · tail",
             border_style="cyan",
+            padding=(0, 1),
         )
     )
 
+    if have_local:
+        _tail_local(local_path, interval=interval)
+        return
+
     seen = 0
-    last_status = ""
+    warned = False
     try:
         with httpx.Client(timeout=30.0, headers=headers) as client:
             while True:
@@ -965,9 +1068,21 @@ def tail(
                         else "running"
                     )
                 except httpx.RequestError as exc:
-                    if last_status != f"err:{exc}":
-                        console.print(f"[yellow]waiting…[/yellow] {exc}")
-                        last_status = f"err:{exc}"
+                    # If the orchestrator never comes up but a local
+                    # trace appears, switch over.
+                    if local_path.exists():
+                        console.print(
+                            "[yellow]http unavailable; switching to local trace…[/yellow]"
+                        )
+                        _tail_local(local_path, interval=interval)
+                        return
+                    if not warned:
+                        console.print(
+                            f"[yellow]http unavailable[/yellow] ({exc}); "
+                            "no local trace yet — start `agentcore serve` "
+                            "or run `agentcore plan` to generate one"
+                        )
+                        warned = True
                     status = "running"
 
                 if status in ("done", "failed", "cancelled"):
@@ -981,6 +1096,50 @@ def tail(
                     )
                     break
                 time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("[yellow]tail stopped[/yellow]")
+
+
+def _tail_local(path: Path, *, interval: float) -> None:
+    """Follow a `~/.agentcore/traces/<id>.jsonl` file. Renders each JSON
+    line as a colour-coded event. Exits when the file stops growing
+    after the last event is `outcome` for the final agent, or on
+    Ctrl-C."""
+    import time
+
+    pos = 0
+    idle_ticks = 0
+    last_kind = ""
+    try:
+        while True:
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except FileNotFoundError:
+                console.print("[yellow]trace file gone[/yellow]")
+                return
+            if chunk:
+                idle_ticks = 0
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    _render_trace_event(evt)
+                    last_kind = evt.get("kind", "")
+            else:
+                idle_ticks += 1
+                # If 10 polls go by with no new lines and the last
+                # event was an outcome / error, treat it as terminal.
+                if idle_ticks >= 10 and last_kind in ("outcome", "error"):
+                    console.rule("[bold green]trace idle (chain finished)[/bold green]")
+                    return
+            time.sleep(interval)
     except KeyboardInterrupt:
         console.print("[yellow]tail stopped[/yellow]")
 
