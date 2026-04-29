@@ -60,3 +60,4 @@ pgdata/
 /.context-engine
 /docs
 /.claude
+/.playwright-mcp

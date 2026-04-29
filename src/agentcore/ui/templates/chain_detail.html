@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Chain {{ chain_id[:8] }}… · agentcore{% endblock %}
+{% block body_attrs %}{% if not chain or chain.status == 'running' %}data-refresh="5000"{% endif %}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Chain</h1>
+    <p class="subtitle"><code>{{ chain_id }}</code></p>
+  </div>
+  <div class="row">
+    {% if chain %}
+      <span class="badge badge-{{ chain.status }}">{{ chain.status }}</span>
+    {% else %}
+      <span class="badge badge-running">running</span>
+    {% endif %}
+    <a href="{{ url_for('ui-chains') }}" class="small muted">← all chains</a>
+  </div>
+</div>
+
+{% if chain and chain.status == 'failed' and chain.error %}
+<section class="card" style="border-color: var(--danger)">
+  <div class="card-title">
+    <h3 style="color: var(--danger)"><i data-lucide="alert-triangle" class="icon"></i> Failed</h3>
+  </div>
+  <pre>{{ chain.error }}</pre>
+</section>
+{% endif %}
+
+{% if chain and chain.hops %}
+<section class="card">
+  <div class="card-title">
+    <h2>Hops ({{ chain.hops|length }})</h2>
+  </div>
+  {% for hop in chain.hops %}
+  <div class="card" style="margin-bottom: 12px; background: var(--pico-background-color)">
+    <div class="row">
+      <strong>{{ loop.index }}. {{ hop.agent }}</strong>
+      <span class="badge badge-{{ hop.status }}">{{ hop.status }}</span>
+      {% if hop.delegate_to %}
+        <span class="muted small">→ {{ hop.delegate_to }}</span>
+      {% endif %}
+    </div>
+    {% if hop.output %}
+      <details style="margin-top: 8px">
+        <summary class="muted small">Output</summary>
+        <pre>{{ hop.output | tojson(indent=2) }}</pre>
+      </details>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% elif not chain %}
+<div class="empty">
+  Chain is still running or the result has not been cached yet. This page
+  auto-refreshes every 5s.
+</div>
+{% else %}
+<div class="empty">No hops recorded for this chain.</div>
+{% endif %}
+
+{% if in_flight %}
+<section class="card">
+  <div class="card-title">
+    <h3>Pending chain jobs</h3>
+    <span class="muted small">{{ in_flight|length }}</span>
+  </div>
+  <table>
+    <thead><tr><th>Job</th><th>Status</th><th>Attempts</th><th>Worker</th><th>Age</th></tr></thead>
+    <tbody>
+      {% for j in in_flight %}
+      <tr>
+        <td><code>{{ j.id }}</code></td>
+        <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+        <td class="mono">{{ j.attempts }}</td>
+        <td class="small mono truncate">{{ j.locked_by or '—' }}</td>
+        <td class="muted small nowrap">{{ j.age }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}

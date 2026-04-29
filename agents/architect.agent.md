@@ -10,7 +10,10 @@ llm:
   provider: bedrock
   model: moonshot.kimi-k2-thinking
   temperature: 0.2
-  max_tokens: 4096
+  # Generous budget — multi-file plans with detailed file_to_change
+  # rationales and risks easily blow past 4k tokens once thinking
+  # overhead is counted. Truncation drops required output fields.
+  max_tokens: 8192
 
 # ─── SOUL: persona ────────────────────────────────────────────────────────
 soul:

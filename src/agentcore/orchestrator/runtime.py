@@ -197,15 +197,31 @@ class Runtime:
                 partials.append(await self._one_shot(spec, sub))
             output = self._merge_outputs(spec, partials)
 
-        # 4. Validate the (merged) output once.
+        # 4. Validate the (merged) output. If shape doesn't match the
+        #    contract (LLMs occasionally rename fields — `summary`
+        #    instead of `plan_summary`, `changes` instead of `diffs`),
+        #    re-ask with the missing-field list before failing the hop.
         try:
             validate_payload(
                 spec.contract.outputs, output, agent=spec.name, direction="output"
             )
-        except ContractViolation as exc:
-            self._record(handoff.task_id, handoff.step, "error", spec.name,
-                         {"contract": exc.errors, "raw": str(output)[:1000]})
-            raise
+        except ContractViolation as first_err:
+            self._record(
+                handoff.task_id, handoff.step, "llm_retry", spec.name,
+                {"reason": "contract_violation", "errors": first_err.errors[:3]},
+            )
+            output = await self._reask_with_contract(spec, handoff, first_err)
+            try:
+                validate_payload(
+                    spec.contract.outputs, output,
+                    agent=spec.name, direction="output",
+                )
+            except ContractViolation as exc:
+                self._record(
+                    handoff.task_id, handoff.step, "error", spec.name,
+                    {"contract": exc.errors, "raw": str(output)[:1000]},
+                )
+                raise
 
         # 5. Outcome
         delegate_to = self._infer_delegation(spec, output)
@@ -365,6 +381,38 @@ class Runtime:
             "test_run": last_run or {},
             "test_attempts": attempts,
         }
+
+    async def _reask_with_contract(
+        self, spec: AgentSpec, handoff: Handoff, err: ContractViolation,
+    ) -> dict[str, Any]:
+        """Re-prompt the agent after a contract-shape mismatch.
+
+        We don't blindly retry the same prompt — we tell the model
+        exactly which required fields it dropped and re-emit the
+        schema hint so it can correct course on a single second pass.
+        """
+        messages = await self._render_messages(spec, handoff)
+        schema_hint = self._json_schema_hint(spec.contract)
+        nudge = (
+            "Your previous response failed contract validation:\n"
+            f"  {'; '.join(err.errors[:5])}\n\n"
+            "Re-emit the JSON object using the EXACT field names from "
+            "the OUTPUT schema below. Include every required field. "
+            "No extra fields, no `<think>` tags, no markdown fences.\n\n"
+            f"{schema_hint}"
+        )
+        messages = [*messages, ChatMessage(role="user", content=nudge)]
+        try:
+            if spec.contract.sla_seconds:
+                resp = await asyncio.wait_for(
+                    self.router.complete(messages, spec.llm),
+                    timeout=float(spec.contract.sla_seconds),
+                )
+            else:
+                resp = await self.router.complete(messages, spec.llm)
+        except TimeoutError as exc:
+            raise SLAExceeded(spec.name, spec.contract.sla_seconds) from exc
+        return self._parse_json_block(resp.text)
 
     async def _one_shot(self, spec: AgentSpec, handoff: Handoff) -> dict[str, Any]:
         """Render messages, call the LLM honouring SLA, parse JSON.
@@ -691,18 +739,42 @@ class Runtime:
         )
         rules = _load_rules(get_settings().rules_path)
         rules_block = f"# PROJECT RULES\n{rules}\n\n" if rules else ""
+        # Hard output-format directive at the END of the system prompt
+        # (recency wins in long contexts). Tells thinking-mode models to
+        # skip <think>...</think> blocks because (a) we strip them
+        # post-hoc anyway and (b) on heavy multi-file emissions the
+        # thinking block eats the response budget and the JSON gets
+        # truncated, dropping required fields.
+        output_directive = (
+            "\n\n# OUTPUT — STRICT\n"
+            "Reply with EXACTLY ONE JSON object matching the schema "
+            "above. Begin your reply with `{`. End with `}`. NO prose "
+            "before or after. NO `<think>...</think>` blocks (we strip "
+            "them post-hoc, and they eat your output budget — JSON gets "
+            "truncated and required fields fall off). NO markdown "
+            "fences around the outermost object. Prioritise emitting "
+            "the COMPLETE JSON over verbose reasoning; if you sense "
+            "you're approaching the token cap, cut everything except "
+            "the JSON envelope."
+        )
         system = (
             f"{rules_block}{spec.system_prompt}\n\n{soul}\n\n{schema}"
+            f"{output_directive}"
         ).strip()
         context_block = await self._build_context_block(spec, handoff)
+        # Mirror the directive at the START of the user message too —
+        # so the very first thing the model reads is "JSON only", then
+        # the payload, then a closing reminder.
         user = (
+            "Output a single JSON object that matches the OUTPUT schema. "
+            "JSON only. No thinking blocks, no markdown, no prose.\n\n"
             f"Inbound handoff from `{handoff.from_agent}` (task {handoff.task_id}, "
             f"step {handoff.step}).\n\n"
             f"Payload (validated against your inputs):\n```json\n"
             f"{json.dumps(handoff.payload, indent=2)}\n```\n"
             f"{context_block}\n"
-            "Respond with a single JSON object matching the OUTPUT schema. "
-            "Do not include any prose outside the JSON."
+            "Reply now with the JSON object — no preamble, no `<think>` "
+            "tag, just `{...}`."
         )
         return [
             ChatMessage(role="system", content=system),

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Wiki · agentcore{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Wiki</h1>
+    <p class="subtitle">
+      <code>{{ root }}</code> · collection <code>wiki:{{ project }}:{{ branch }}</code>
+    </p>
+  </div>
+  <div class="row">
+    <span class="badge badge-info">{{ pages|length }} pages</span>
+    {% if total_sources is defined %}
+    <span class="badge">{{ total_sources }} sources</span>
+    {% endif %}
+  </div>
+</div>
+
+<section class="card">
+  {% if pages %}
+  <table>
+    <thead>
+      <tr><th>Path</th><th>Title</th><th>Sources</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for p in pages %}
+      <tr>
+        <td><code>{{ p.rel }}</code></td>
+        <td>{{ p.title or '—' }}</td>
+        <td class="muted small">{{ p.sources|length }} file(s)</td>
+        <td>
+          <a href="{{ url_for('ui-wiki-page', rel=p.rel) }}{% if request.query_params.get('project') %}?project={{ request.query_params.get('project') }}{% endif %}"
+             class="outline small" style="padding: 2px 10px">open →</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    No pages yet. Run <code>agentcore wiki rebuild</code> or <code>POST /wiki/refresh</code> to seed.
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

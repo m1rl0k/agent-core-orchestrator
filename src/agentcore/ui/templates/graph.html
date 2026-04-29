@@ -1,0 +1,402 @@
+{% extends "base.html" %}
+{% block title %}Graph · agentcore{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Knowledge graph</h1>
+    <p class="subtitle">Top {{ node_count }} nodes by edge weight · {{ edge_count }} edges</p>
+  </div>
+  <div class="row">
+    {% for kind, n in kinds.items() %}
+      <button
+        class="outline kind-filter badge badge-{{ kind }}"
+        data-kind="{{ kind }}"
+        style="padding: 2px 8px; cursor: pointer"
+      >{{ kind }} · {{ n }}</button>
+    {% endfor %}
+  </div>
+</div>
+
+{% if nodes %}
+<section class="card" style="padding: 0; overflow: hidden">
+  <div class="card-title" style="padding: 12px 16px 0">
+    <h2 style="margin: 0">Graph view</h2>
+    <div class="muted small">
+      scroll to zoom · drag canvas to pan · click node for details
+      <button id="reset-view" class="outline small" style="margin-left: 12px; padding: 2px 8px">reset</button>
+    </div>
+  </div>
+  <div style="position: relative">
+    <svg
+      id="graph-svg"
+      viewBox="0 0 900 560"
+      style="width: 100%; height: 560px; background: var(--pico-background-color); cursor: grab; display: block"
+    >
+      <g id="graph-root"></g>
+    </svg>
+    <aside
+      id="info-panel"
+      style="
+        position: absolute; top: 12px; right: 12px; width: 280px; max-height: 520px;
+        overflow-y: auto; padding: 12px 14px; background: var(--pico-card-background-color);
+        border: 1px solid var(--pico-muted-border-color); border-radius: var(--radius);
+        display: none; font-size: 12px
+      "
+    >
+      <div class="card-title" style="margin-bottom: 8px">
+        <strong id="ip-title">—</strong>
+        <button id="ip-close" class="outline small" style="padding: 0 6px">×</button>
+      </div>
+      <div id="ip-kind" class="muted small" style="margin-bottom: 8px"></div>
+      <div id="ip-attrs" style="font-family: var(--font-mono); font-size: 11px; line-height: 1.5"></div>
+      <div id="ip-edges" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--pico-muted-border-color)"></div>
+    </aside>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-title">
+    <h2>Nodes</h2>
+    <span class="muted small">top {{ nodes|length }} by weight</span>
+  </div>
+  <table>
+    <thead><tr><th>ID</th><th>Kind</th><th>Weight</th></tr></thead>
+    <tbody>
+      {% for n in nodes[:40] %}
+      <tr>
+        <td><code class="truncate">{{ n.id }}</code></td>
+        <td><span class="badge badge-{{ n.kind }}">{{ n.kind }}</span></td>
+        <td class="mono">{{ "%.2f"|format(n.score) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<script id="graph-data" type="application/json">
+{
+  "nodes": [{% for n in nodes %}{"id": {{ n.id|tojson }}, "kind": {{ n.kind|tojson }}, "label": {{ n.label|tojson }}, "score": {{ n.score }}, "attrs": {{ n.attrs|tojson }}}{% if not loop.last %},{% endif %}{% endfor %}],
+  "edges": [{% for e in edges %}{"source": {{ e.source|tojson }}, "target": {{ e.target|tojson }}, "relation": {{ e.relation|tojson }}, "weight": {{ e.weight }}}{% if not loop.last %},{% endif %}{% endfor %}]
+}
+</script>
+
+<script>
+(function () {
+  const data = JSON.parse(document.getElementById("graph-data").textContent);
+  const svg = document.getElementById("graph-svg");
+  const root = document.getElementById("graph-root");
+  const panel = document.getElementById("info-panel");
+  const ipTitle = document.getElementById("ip-title");
+  const ipKind = document.getElementById("ip-kind");
+  const ipAttrs = document.getElementById("ip-attrs");
+  const ipEdges = document.getElementById("ip-edges");
+  const resetBtn = document.getElementById("reset-view");
+
+  const W = 900, H = 560;
+  const KIND_COLOR = {
+    agent: "#00b894", task: "#3b82f6", file: "#8b5cf6",
+    symbol: "#f59e0b", snippet: "#ef4444", status: "#64748b",
+  };
+
+  // Filter state persists in localStorage keyed by project, so switching
+  // tenants doesn't carry filters across. Empty set = show all.
+  const PROJECT = new URLSearchParams(window.location.search).get("project") || "default";
+  const FILTER_KEY = `agentcore-graph-filters:${PROJECT}`;
+  const hidden = new Set(JSON.parse(localStorage.getItem(FILTER_KEY) || "[]"));
+
+  // Build node + edge models with initial positions.
+  const nodes = data.nodes.map(n => ({
+    ...n, x: W/2 + (Math.random()-0.5)*200, y: H/2 + (Math.random()-0.5)*200,
+    vx: 0, vy: 0, r: 4 + Math.min(6, Math.log2(1 + (n.score || 1))),
+  }));
+  const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+  const edges = data.edges
+    .map(e => ({ s: byId[e.source], t: byId[e.target], relation: e.relation, weight: e.weight }))
+    .filter(e => e.s && e.t);
+
+  // Force-directed layout — 150 ticks.
+  for (let step = 0; step < 150; step++) {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i+1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = b.x-a.x, dy = b.y-a.y;
+        const d2 = dx*dx + dy*dy + 0.01;
+        const f = 450 / d2;
+        const fx = (dx/Math.sqrt(d2))*f, fy = (dy/Math.sqrt(d2))*f;
+        a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
+      }
+    }
+    for (const e of edges) {
+      const dx = e.t.x-e.s.x, dy = e.t.y-e.s.y;
+      const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
+      const f = (d - 90) * 0.03;
+      const fx = (dx/d)*f, fy = (dy/d)*f;
+      e.s.vx += fx; e.s.vy += fy; e.t.vx -= fx; e.t.vy -= fy;
+    }
+    for (const n of nodes) {
+      n.vx *= 0.85; n.vy *= 0.85;
+      n.x += n.vx; n.y += n.vy;
+      n.x += (W/2 - n.x) * 0.01;
+      n.y += (H/2 - n.y) * 0.01;
+      n.x = Math.max(20, Math.min(W-20, n.x));
+      n.y = Math.max(20, Math.min(H-20, n.y));
+    }
+  }
+
+  // Render — store DOM refs on each node/edge so filtering toggles
+  // visibility instead of re-rendering the whole scene.
+  const SVGNS = "http://www.w3.org/2000/svg";
+  for (const e of edges) {
+    // Wider invisible "hit" line so edges are clickable even at thin
+    // stroke widths; the visible line carries the styling.
+    const hit = document.createElementNS(SVGNS, "line");
+    hit.setAttribute("x1", e.s.x); hit.setAttribute("y1", e.s.y);
+    hit.setAttribute("x2", e.t.x); hit.setAttribute("y2", e.t.y);
+    hit.setAttribute("stroke", "transparent");
+    hit.setAttribute("stroke-width", "8");
+    hit.style.cursor = "pointer";
+    hit.addEventListener("click", (ev) => { ev.stopPropagation(); selectEdge(e); });
+    root.appendChild(hit);
+
+    const l = document.createElementNS(SVGNS, "line");
+    l.setAttribute("x1", e.s.x); l.setAttribute("y1", e.s.y);
+    l.setAttribute("x2", e.t.x); l.setAttribute("y2", e.t.y);
+    l.setAttribute("stroke", "currentColor");
+    l.setAttribute("stroke-width", "0.5");
+    l.setAttribute("opacity", "0.25");
+    l.dataset.source = e.s.id; l.dataset.target = e.t.id;
+    l.style.pointerEvents = "none";  // hit line takes the click
+    root.appendChild(l);
+    e.el = l;
+    e.hitEl = hit;
+  }
+  // Compact a long node label to a glanceable form.
+  // task:abc123def... -> abc123de
+  // file:src/long/path/to/file.py -> file.py
+  // snippet:tests/test_x.py:1-12#hash -> test_x.py:1-12
+  // Otherwise: trim at 24 chars.
+  function shortLabel(n) {
+    const lbl = n.label || n.id || "";
+    if (n.kind === "task") return lbl.replace(/^task:/, "").slice(0, 8);
+    if (n.kind === "file") return lbl.split("/").pop() || lbl;
+    if (n.kind === "snippet") {
+      const stripped = lbl.replace(/#[0-9a-f]+$/, "");
+      return stripped.split("/").pop() || stripped.slice(0, 24);
+    }
+    if (n.kind === "agent") return lbl.replace(/^agent:/, "");
+    return lbl.length > 24 ? lbl.slice(0, 22) + "…" : lbl;
+  }
+
+  // Pick which nodes show labels by default — top-K by score, plus
+  // every agent (always small set, always interesting). Others get
+  // labels only on hover.
+  const SHOW_TOP_K = 25;
+  const labelByDefault = new Set([
+    ...nodes.filter(n => n.kind === "agent").map(n => n.id),
+    ...[...nodes].sort((a, b) => (b.score || 0) - (a.score || 0))
+        .slice(0, SHOW_TOP_K).map(n => n.id),
+  ]);
+
+  for (const n of nodes) {
+    const g = document.createElementNS(SVGNS, "g");
+    g.setAttribute("transform", `translate(${n.x},${n.y})`);
+    g.style.cursor = "pointer";
+    const c = document.createElementNS(SVGNS, "circle");
+    c.setAttribute("r", n.r);
+    c.setAttribute("fill", KIND_COLOR[n.kind] || "#94a3b8");
+    c.setAttribute("opacity", "0.9");
+    const label = document.createElementNS(SVGNS, "text");
+    label.setAttribute("x", n.r + 3);
+    label.setAttribute("y", 3);
+    label.setAttribute("font-size", "9");
+    label.setAttribute("font-family", "IBM Plex Mono, ui-monospace, monospace");
+    label.setAttribute("fill", "currentColor");
+    label.setAttribute("opacity", labelByDefault.has(n.id) ? "0.85" : "0");
+    label.style.pointerEvents = "none";
+    label.textContent = shortLabel(n);
+
+    // Native browser tooltip carries the full label (good a11y default).
+    const titleEl = document.createElementNS(SVGNS, "title");
+    titleEl.textContent = `${n.kind} · ${n.label}`;
+    g.appendChild(titleEl);
+
+    g.appendChild(c); g.appendChild(label);
+    // Reveal label on hover for nodes that don't show one by default.
+    if (!labelByDefault.has(n.id)) {
+      g.addEventListener("mouseenter", () => label.setAttribute("opacity", "0.85"));
+      g.addEventListener("mouseleave", () => label.setAttribute("opacity", "0"));
+    }
+    g.addEventListener("click", (ev) => { ev.stopPropagation(); selectNode(n); });
+    root.appendChild(g);
+    n.el = g;
+    n.labelEl = label;
+  }
+
+  // Apply persisted filter visibility.
+  applyFilters();
+
+  function applyFilters() {
+    for (const n of nodes) {
+      n.el.style.display = hidden.has(n.kind) ? "none" : "";
+    }
+    for (const e of edges) {
+      const hide = hidden.has(e.s.kind) || hidden.has(e.t.kind);
+      e.el.style.display = hide ? "none" : "";
+    }
+    // Reflect toggled state on the filter buttons.
+    document.querySelectorAll(".kind-filter").forEach(btn => {
+      const k = btn.dataset.kind;
+      btn.style.opacity = hidden.has(k) ? "0.3" : "1";
+    });
+  }
+
+  document.querySelectorAll(".kind-filter").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const k = btn.dataset.kind;
+      if (hidden.has(k)) hidden.delete(k); else hidden.add(k);
+      localStorage.setItem(FILTER_KEY, JSON.stringify([...hidden]));
+      applyFilters();
+    });
+  });
+
+  // Node selection → info panel.
+  function selectNode(n) {
+    panel.style.display = "block";
+    ipTitle.textContent = n.label;
+    ipKind.innerHTML = `<span class="badge badge-${n.kind}">${n.kind}</span> <span class="muted">score ${n.score.toFixed(2)}</span>`;
+    // Dump attrs one per line, mono font.
+    const attrs = n.attrs || {};
+    ipAttrs.innerHTML = Object.keys(attrs).length
+      ? Object.entries(attrs)
+          .map(([k, v]) => `<div><span class="muted">${k}</span>: ${JSON.stringify(v)}</div>`)
+          .join("")
+      : '<div class="muted">(no attrs)</div>';
+    // Incident edges (capped to keep the panel readable).
+    const incident = edges.filter(e => e.s.id === n.id || e.t.id === n.id).slice(0, 20);
+    if (incident.length) {
+      ipEdges.innerHTML = '<strong class="small">Connections</strong><ul style="margin: 4px 0 0; padding-left: 16px">'
+        + incident.map(e => {
+            const other = e.s.id === n.id ? e.t : e.s;
+            const dir = e.s.id === n.id ? "→" : "←";
+            return `<li>${dir} <span class="badge badge-${other.kind}" style="font-size: 10px">${other.kind}</span> <code style="font-size: 10px">${other.label}</code> <span class="muted">(${e.relation})</span></li>`;
+          }).join("")
+        + '</ul>';
+    } else {
+      ipEdges.innerHTML = "";
+    }
+    // Highlight selected node + its neighbours.
+    const neighbours = new Set([n.id, ...incident.flatMap(e => [e.s.id, e.t.id])]);
+    for (const m of nodes) {
+      m.el.querySelector("circle").setAttribute("opacity", neighbours.has(m.id) ? "1" : "0.2");
+    }
+    for (const e of edges) {
+      const on = e.s.id === n.id || e.t.id === n.id;
+      e.el.setAttribute("stroke", on ? "var(--accent)" : "currentColor");
+      e.el.setAttribute("opacity", on ? "0.8" : "0.1");
+    }
+  }
+  // Edge selection → info panel.
+  function selectEdge(e) {
+    panel.style.display = "block";
+    ipTitle.textContent = `${e.s.label} → ${e.t.label}`;
+    ipKind.innerHTML = `<span class="badge">edge</span> <span class="muted">${e.relation} · weight ${e.weight}</span>`;
+    ipAttrs.innerHTML = `
+      <div><span class="muted">source</span>: <span class="badge badge-${e.s.kind}">${e.s.kind}</span> <code>${e.s.label}</code></div>
+      <div><span class="muted">target</span>: <span class="badge badge-${e.t.kind}">${e.t.kind}</span> <code>${e.t.label}</code></div>
+      <div><span class="muted">relation</span>: <code>${e.relation}</code></div>
+      <div><span class="muted">weight</span>: <code>${e.weight}</code></div>
+    `;
+    ipEdges.innerHTML = "";
+    // Highlight the edge + its endpoints.
+    for (const m of nodes) {
+      const on = m.id === e.s.id || m.id === e.t.id;
+      m.el.querySelector("circle").setAttribute("opacity", on ? "1" : "0.2");
+    }
+    for (const f of edges) {
+      const on = f === e;
+      f.el.setAttribute("stroke", on ? "var(--accent)" : "currentColor");
+      f.el.setAttribute("opacity", on ? "1" : "0.1");
+      f.el.setAttribute("stroke-width", on ? "1.5" : "0.5");
+    }
+  }
+
+  document.getElementById("ip-close").addEventListener("click", () => {
+    panel.style.display = "none";
+    for (const m of nodes) m.el.querySelector("circle").setAttribute("opacity", "0.9");
+    for (const e of edges) {
+      e.el.setAttribute("stroke", "currentColor");
+      e.el.setAttribute("opacity", "0.25");
+      e.el.setAttribute("stroke-width", "0.5");
+    }
+  });
+  svg.addEventListener("click", (ev) => {
+    if (ev.target === svg || ev.target === root) {
+      panel.style.display = "none";
+      for (const m of nodes) m.el.querySelector("circle").setAttribute("opacity", "0.9");
+      for (const e of edges) {
+      e.el.setAttribute("stroke", "currentColor");
+      e.el.setAttribute("opacity", "0.25");
+      e.el.setAttribute("stroke-width", "0.5");
+    }
+    }
+  });
+
+  // Pan + zoom. Single transform matrix on the <g id="graph-root">.
+  // State persists per project in sessionStorage so clicking around
+  // and coming back feels continuous, but we don't leak across tabs.
+  const VIEW_KEY = `agentcore-graph-view:${PROJECT}`;
+  let view = JSON.parse(sessionStorage.getItem(VIEW_KEY) || '{"scale":1,"tx":0,"ty":0}');
+  function applyView() {
+    root.setAttribute("transform", `translate(${view.tx},${view.ty}) scale(${view.scale})`);
+    sessionStorage.setItem(VIEW_KEY, JSON.stringify(view));
+  }
+  applyView();
+
+  resetBtn.addEventListener("click", () => {
+    view = { scale: 1, tx: 0, ty: 0 };
+    applyView();
+  });
+
+  // Wheel → zoom around cursor, SVG coords.
+  svg.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const pt = svg.createSVGPoint();
+    pt.x = ev.clientX; pt.y = ev.clientY;
+    const ctm = svg.getScreenCTM().inverse();
+    const { x, y } = pt.matrixTransform(ctm);
+    const factor = ev.deltaY < 0 ? 1.1 : 1/1.1;
+    const next = Math.max(0.2, Math.min(5, view.scale * factor));
+    // Keep the point under cursor stable across zoom.
+    view.tx = x - (x - view.tx) * (next / view.scale);
+    view.ty = y - (y - view.ty) * (next / view.scale);
+    view.scale = next;
+    applyView();
+  }, { passive: false });
+
+  // Drag → pan.
+  let dragging = false, dragStart = null;
+  svg.addEventListener("mousedown", (ev) => {
+    if (ev.target.closest("g[transform]")) return; // click on node, not drag
+    dragging = true; dragStart = { x: ev.clientX - view.tx, y: ev.clientY - view.ty };
+    svg.style.cursor = "grabbing";
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (!dragging) return;
+    view.tx = ev.clientX - dragStart.x;
+    view.ty = ev.clientY - dragStart.y;
+    applyView();
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    svg.style.cursor = "grab";
+  });
+})();
+</script>
+{% else %}
+<div class="empty">
+  No graph data yet. Nodes and edges get written as agents hand off to each
+  other and graphify reports impact. Run <code>agentcore plan "..."</code>
+  a few times and this view will populate.
+</div>
+{% endif %}
+{% endblock %}

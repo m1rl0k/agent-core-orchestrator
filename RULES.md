@@ -62,25 +62,46 @@ config files; humans/CI install.
 
 ## G. Review (for any role producing a verdict)
 
-When you reject:
+**Bias toward shipping.** The approval bar is "I would ship this" —
+not "I would ship this if every nit were fixed". You're voting on
+merge-readiness, not on whether the change is the platonic ideal.
 
-- Cite a **concrete, reproducible** failure. "Test X fails with input
-  Y" — not "looks incomplete."
-- Each `blocker` must be actionable in one step. Vague suggestions
-  ("improve handling") waste a hop.
-- If the prior round's blockers were addressed in good faith,
-  **approve and move on** — don't raise a fresh laundry list of
-  new concerns the previous round missed. New blockers only when
-  they're material (would block ship), not stylistic.
-- Distinguish blocker type:
-  - **patch-level** → route_back_to: developer
-  - **plan-level** (approach is wrong) → route_back_to: architect
-  - **test-coverage gap** → route_back_to: qa
-  - **deploy-readiness** → route_back_to: ops
+### Reject ONLY on material blockers
 
-When you approve, you're saying *I would ship this*. If you wouldn't
-ship it, don't approve. If you would ship it with reservations,
-state them in `comments`, not `blockers`.
+A *material* blocker would actually break production or the user's
+intent: bug unfixed, failing test, missing required scaffolding,
+contract mismatch. Style preferences, additional edge cases that
+would be nice-to-have, "could be more thorough" — these are NOT
+material. Note them in `comments` and **approve**.
+
+Rule of thumb: if you wouldn't open a sev2 ticket about it, it's
+not a blocker.
+
+### Convergence > churn
+
+If prior-round blockers were addressed in good faith, approve. Do
+NOT raise a fresh laundry list of NEW concerns you didn't surface
+earlier — that's moving the goalposts. New blockers are legitimate
+ONLY if (a) the fix introduced them or (b) they would genuinely
+break ship.
+
+### When you do reject
+
+- Cite a **concrete, reproducible** failure. "Test X fails with
+  input Y" — not "looks incomplete".
+- Each `blocker` must be a single one-step action. Vague
+  suggestions ("improve handling") waste a hop.
+- Set `route_back_to` to the role best able to act:
+  - **patch-level** → `developer` (default)
+  - **plan-level** (approach is wrong) → `architect`
+  - **test-coverage gap** → `qa`
+  - **deploy-readiness** → `ops`
+
+### What `approved=true` means
+
+You'd ship it. If you wouldn't ship it, don't approve. If you'd
+ship it *with reservations*, those reservations go in `comments`,
+not `blockers`.
 
 ## H. Quality bar
 

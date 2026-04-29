@@ -283,6 +283,24 @@ def build_app() -> FastAPI:
 
     app = FastAPI(title="agent-core-orchestrator", lifespan=lifespan)
 
+    # Mount the lightweight Jinja UI at /ui. Read-only views over the
+    # same state the HTTP API exposes — dashboard, agents, chains,
+    # jobs, wiki. Wiki tab only appears when AGENTCORE_ENABLE_WIKI=true.
+    try:
+        from agentcore.ui import mount_ui
+
+        mount_ui(
+            app,
+            settings=settings,
+            registry=registry,
+            job_queue=job_queue,
+            idem_cache=idem_cache,
+            host_info=detect_host(),
+            wiki_storage=None,  # populated by _register_wiki_routes when enabled
+        )
+    except Exception as exc:
+        log.warning("ui.mount_failed", error=str(exc))
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         host = detect_host()
@@ -405,6 +423,13 @@ def build_app() -> FastAPI:
             ) from exc
         save_graph_best_effort()
         resp_dict = RunResponse(task_id=handoff.task_id, hops=hops).model_dump()
+        # Always stash chain state keyed by task_id so the UI has exactly
+        # one place to look for any run's hops — durable or not.
+        idem_cache.put(
+            "chain", handoff.task_id,
+            {"chain_id": handoff.task_id, "status": "done", "hops": hops},
+            project_id=pid, ttl_seconds=86400.0,
+        )
         if idempotency_key:
             idem_cache.put("run", idempotency_key, resp_dict, project_id=pid)
         return resp_dict
@@ -433,9 +458,16 @@ def build_app() -> FastAPI:
         except SLAExceeded as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
         save_graph_best_effort()
-        resp = RunResponse(
-            task_id=handoff.task_id,
-            hops=[{"agent": outcome.agent, "status": outcome.status, "output": outcome.output}],
+        hops = [
+            {"agent": outcome.agent, "status": outcome.status, "output": outcome.output}
+        ]
+        resp = RunResponse(task_id=handoff.task_id, hops=hops)
+        # Mirror to scope='chain' — same rule as /run: task_id is the
+        # canonical lookup key.
+        idem_cache.put(
+            "chain", handoff.task_id,
+            {"chain_id": handoff.task_id, "status": "done", "hops": hops},
+            project_id=pid, ttl_seconds=86400.0,
         )
         if idempotency_key:
             idem_cache.put("handoff", idempotency_key, resp.model_dump(), project_id=pid)

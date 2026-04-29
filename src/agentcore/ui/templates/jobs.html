@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Jobs · agentcore{% endblock %}
+{% block body_attrs %}data-refresh="8000"{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Job queue</h1>
+    <p class="subtitle">Durable Postgres queue · auto-refreshes every 8s</p>
+  </div>
+  <div class="row">
+    <span class="badge badge-queued">{{ counts.queued }} queued</span>
+    <span class="badge badge-running">{{ counts.running }} running</span>
+    <span class="badge badge-dead">{{ counts.dead_letter }} dead</span>
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-title">
+    <h2>Active &amp; recent</h2>
+  </div>
+  {% if jobs %}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Kind</th>
+        <th>Status</th>
+        <th>Attempts</th>
+        <th>Worker</th>
+        <th>Age</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td><code>{{ j.id }}</code></td>
+        <td><code>{{ j.kind }}</code></td>
+        <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+        <td class="mono">{{ j.attempts }}/{{ j.max_attempts }}</td>
+        <td class="small mono truncate">{{ j.locked_by or '—' }}</td>
+        <td class="muted small nowrap">{{ j.age or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">Queue is empty.</div>
+  {% endif %}
+</section>
+
+{% if dead_letter %}
+<section class="card">
+  <div class="card-title">
+    <h2><i data-lucide="skull" class="icon"></i> Dead-letter</h2>
+    <span class="muted small">{{ dead_letter|length }} preserved for review</span>
+  </div>
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Kind</th><th>Error</th><th>Finished</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for j in dead_letter %}
+      <tr>
+        <td><code>{{ j.id }}</code></td>
+        <td><code>{{ j.kind }}</code></td>
+        <td class="small truncate">{{ j.error or '—' }}</td>
+        <td class="muted small nowrap">{{ j.finished_at or '—' }}</td>
+        <td><a href="/jobs/{{ j.id }}/retry" role="button" class="outline small">Retry</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}

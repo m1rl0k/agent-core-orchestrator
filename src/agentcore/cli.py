@@ -454,7 +454,7 @@ async def _plan_async_body(
         graph=graph, graphify=graphify, retriever=retriever,
     )
 
-    state, task_id = await _run_chain(runtime, brief, chain, max_hops)
+    state, task_id = await _safe_run_chain(runtime, brief, chain, max_hops)
 
     # Review loop — default ON. If any role rejects, route back to the
     # role best-suited to fix the blockers and re-chain. Iterates until
@@ -465,17 +465,18 @@ async def _plan_async_body(
         loop_idx = 0
         while True:
             verdicts = await _run_review_round(router, registry, state)
-            console.rule(f"[bold]review round {loop_idx + 1}[/bold]")
+            cap = "" if max_review_loops == 0 else f"/{max_review_loops}"
+            console.rule(
+                f"[bold]review round {loop_idx + 1}{cap}[/bold]",
+                style="cyan",
+            )
             traces.record(TraceEvent(
                 task_id=task_id, step=loop_idx + 1, kind="review_round",
                 actor="cli",
                 detail={"round": loop_idx + 1, "verdicts": len(verdicts)},
             ))
+            _render_verdicts_table(verdicts)
             for v in verdicts:
-                badge = "[green]approved[/green]" if v["approved"] else "[red]rejected[/red]"
-                console.print(f"  {v['agent']:10s} {badge}  {v.get('comments', '')[:80]}")
-                for b in v.get("blockers", [])[:3]:
-                    console.print(f"      ✗ {b}")
                 traces.record(TraceEvent(
                     task_id=task_id, step=loop_idx + 1, kind="verdict",
                     actor=v.get("agent", "?"),
@@ -512,7 +513,7 @@ async def _plan_async_body(
                 detail={"target": target, "blockers": len(blockers)},
             ))
             payload = _synthesize_handoff_payload(target, state, blockers, brief)
-            state, task_id = await _run_chain(
+            state, task_id = await _safe_run_chain(
                 runtime,
                 _compose_revision_brief(brief, blockers, state),
                 chain,
@@ -520,6 +521,7 @@ async def _plan_async_body(
                 start_at=target,
                 payload=payload,
                 task_id=task_id,
+                prior_state=state,
             )
             loop_idx += 1
 
@@ -637,6 +639,67 @@ async def _plan_async_body(
 # ---------------------------------------------------------------------------
 # Plan helpers — chain orchestration, review round, diff apply, PR
 # ---------------------------------------------------------------------------
+
+
+async def _safe_run_chain(
+    runtime: Runtime,
+    brief: str,
+    chain: bool,
+    max_hops: int,
+    *,
+    start_at: str = "architect",
+    payload: dict | None = None,
+    task_id: str | None = None,
+    prior_state: dict | None = None,
+) -> tuple[dict, str]:
+    """Run a chain hop, but never let a mid-flight crash kill the
+    review loop. Contract violations, SLA blowouts, or unparseable
+    LLM output get logged to the trace and surface as a synthetic
+    `developer_output` carrying the error so the next review round
+    routes back through architect (or whoever) cleanly. The original
+    chain id is preserved across the failure."""
+    from agentcore.contracts.envelopes import ContractViolation
+    from agentcore.orchestrator.runtime import HandoffRejected, SLAExceeded
+
+    try:
+        return await _run_chain(
+            runtime, brief, chain, max_hops,
+            start_at=start_at, payload=payload, task_id=task_id,
+        )
+    except (ContractViolation, HandoffRejected, SLAExceeded) as exc:
+        tid = task_id or new_task_id()
+        console.print(
+            Panel(
+                f"[bold red]chain hop failed[/bold red]: {type(exc).__name__}\n"
+                f"[dim]{exc}[/dim]\n\n"
+                f"Treating as a synthetic rejection — review round will "
+                f"route back to address it.",
+                title=f"agentcore · recoverable error · {start_at}",
+                border_style="red",
+                padding=(0, 1),
+            )
+        )
+        # Carry forward whatever the prior chain produced so the
+        # review loop has something to evaluate against. If nothing
+        # exists yet, synthesize a minimal `developer_output` so the
+        # `if state.get("developer_output")` review-loop guard
+        # passes and the verdict round can do its job.
+        state = dict(prior_state or {})
+        if not state.get("developer_output"):
+            state["developer_output"] = {
+                "plan_summary": (
+                    f"<chain failed at {start_at}>: {type(exc).__name__}: "
+                    f"{str(exc)[:300]}"
+                ),
+                "diffs": [],
+                "notes": (
+                    "The chain hop crashed before producing a clean patch. "
+                    "Reviewers should treat this as a hard rejection and "
+                    "route back to architect for a re-plan that yields "
+                    "a more compact diff."
+                ),
+            }
+        return state, tid
 
 
 async def _run_chain(
@@ -770,22 +833,60 @@ async def _run_review_round(
             console=console,
             spinner="dots",
         )
+        # QA-specific hard rule: never approve with failing tests. Other
+        # reviewers may use judgement, but QA is the ground-truth role —
+        # if pytest/equivalent reported a non-zero exit code, that's a
+        # broken patch and approval is off the table.
+        qa_hard_rule = (
+            "\n\n## QA HARD RULE — overrides bias-toward-shipping\n"
+            "Look at `qa_report.test_run.exit_code` and "
+            "`qa_report.failed[]`. If exit_code != 0 OR `failed[]` is "
+            "non-empty, you MUST set approved=false and list the "
+            "failing test(s) as blockers. Real test failures are NEVER "
+            "nits — they're hard ship-blockers. The 'material blocker' "
+            "bar is automatically met when the runner says so.\n"
+            "Conversely: if exit_code == 0 AND failed[] is empty AND "
+            "the diff addresses the brief, you almost certainly "
+            "should approve."
+            if role == "qa" else ""
+        )
         sys = (
             f"You are the {spec.soul.role}. Voice: {spec.soul.voice}. "
-            f"Values: {', '.join(spec.soul.values)}. "
-            "You are reviewing a proposed change. Respond ONLY with a JSON object "
-            "matching the ReviewVerdict schema:\n"
+            f"Values: {', '.join(spec.soul.values)}.\n\n"
+            "You are casting ONE vote on whether the proposed change is "
+            "good enough to ship. Respond with a single JSON object:\n"
             "{\n"
             f'  "agent": "{role}",\n'
-            '  "approved": <true if you would ship this, false otherwise>,\n'
-            '  "blockers": [<list of strings, one per concrete blocker; empty if approved>],\n'
+            '  "approved": <bool>,\n'
+            '  "blockers": [<material reasons it cannot ship; empty if approved>],\n'
             '  "comments": "<one-sentence summary>",\n'
             '  "route_back_to": "<architect|developer|qa|ops>"\n'
-            "}\n"
-            "Be honest. Reject if you'd reject in real review. Set "
-            "`route_back_to` to the role best able to address the blockers "
-            "(architect for plan-level, developer for patch-level, qa for "
-            "test gaps)."
+            "}\n\n"
+            "## Approval bar — bias toward shipping\n"
+            "Approve if the change is correct, in scope, and addresses "
+            "the brief. The bar is 'I would ship this', NOT 'I would "
+            "ship this if every nit were fixed'. You're voting on "
+            "merge-readiness, not on whether you'd nominate it for an "
+            "engineering award.\n\n"
+            "## Reject only on MATERIAL blockers\n"
+            "A material blocker is something that would actually break "
+            "production: bug not fixed, test that doesn't run, missing "
+            "required scaffolding, incorrect contract. Style/naming "
+            "preferences, additional edge cases you'd nice-to-have, or "
+            "'could be more thorough' are NOT material — record them "
+            "in `comments` and approve. If you wouldn't open a sev2 "
+            "ticket about it, it's not a blocker.\n\n"
+            "## Honour prior rounds — convergence over churn\n"
+            "If you can see prior blockers were addressed in good faith, "
+            "approve. Do NOT raise a fresh laundry list of NEW concerns "
+            "you didn't surface in earlier rounds — that's moving the "
+            "goalposts. New blockers are legitimate ONLY if (a) the "
+            "fix introduced them or (b) they would actually break ship.\n\n"
+            "## Routing\n"
+            "If you reject: set `route_back_to` to the role best "
+            "positioned to address it — `developer` for patch-level "
+            "(default), `architect` for plan-level, `qa` for test gaps."
+            f"{qa_hard_rule}"
         )
         user = (
             "Here is the current chain state. Review and emit a verdict.\n\n"
@@ -1167,32 +1268,177 @@ def _tail_local(path: Path, *, interval: float) -> None:
         console.print("[yellow]tail stopped[/yellow]")
 
 
+def _render_verdicts_table(verdicts: list[dict]) -> None:
+    """Render review-round verdicts as a scannable Rich Table.
+
+    Columns: agent, verdict (✓ / ✗), comment (truncated), # blockers,
+    route_back_to (only when rejected). Then list the actual blockers
+    underneath each rejection — indented bullet form so the eye can
+    scan a single row to see WHO rejected, WHY at a glance, and HOW
+    they want it fixed.
+    """
+    table = Table(
+        show_header=True, header_style="bold dim",
+        padding=(0, 1), box=None,
+    )
+    table.add_column("agent", style="bold", min_width=10)
+    table.add_column("verdict", justify="center", min_width=8)
+    table.add_column("comment", overflow="fold")
+    table.add_column("blockers", justify="right", style="dim")
+    table.add_column("→", style="dim", min_width=10)
+    for v in verdicts:
+        approved = bool(v.get("approved"))
+        badge = "[green]✓ approved[/green]" if approved else "[red]✗ rejected[/red]"
+        comment = (v.get("comments") or "")[:90]
+        n_block = len(v.get("blockers") or [])
+        rb = v.get("route_back_to") or ""
+        table.add_row(
+            v.get("agent", "?"), badge, comment,
+            str(n_block) if n_block else "",
+            "" if approved else rb,
+        )
+    console.print(table)
+    # Detail rows for rejections — concrete blockers under each rejecter.
+    for v in verdicts:
+        if v.get("approved") or not v.get("blockers"):
+            continue
+        console.print(f"  [dim]{v.get('agent','?')} blockers:[/dim]")
+        for b in v["blockers"][:5]:
+            console.print(f"    [red]✗[/red] {b[:200]}")
+
+
+_TRACE_PALETTE = {
+    "handoff_in":   ("cyan",    "→"),
+    "llm_call":     ("yellow",  "·"),
+    "llm_retry":    ("yellow",  "↻"),
+    "outcome":      ("green",   "✓"),
+    "error":        ("red",     "✗"),
+    "batch_split":  ("blue",    "⌥"),
+    "batch_chunk":  ("blue",    "·"),
+    "executor":     ("magenta", "▶"),
+    "discovery":    ("magenta", "🔍"),
+    "review_round": ("cyan",    "⟳"),
+    "verdict":      ("white",   "·"),
+    "route_back":   ("yellow",  "↩"),
+    "applied":      ("green",   "✎"),
+    "pr_opened":    ("green",   "⇡"),
+    "result":       ("green",   "★"),
+}
+
+
 def _render_trace_event(evt: dict) -> None:
-    """Color-code one trace event for the tail stream."""
+    """Color-code one trace event for the tail stream.
+
+    Each event renders on a single line with a coloured glyph + kind +
+    one human-readable summary, instead of dumping the raw detail dict.
+    Falls back to the generic dict format for unknown kinds.
+    """
     kind = evt.get("kind", "?")
     actor = evt.get("actor", "?")
     step = evt.get("step", "?")
     detail = evt.get("detail") or {}
-    palette = {
-        "handoff_in":  "cyan",
-        "llm_call":    "yellow",
-        "outcome":     "green",
-        "error":       "red",
-        "batch_split": "blue",
-        "batch_chunk": "blue",
-        "executor":    "magenta",
-        "discovery":   "magenta",
-        "llm_retry":   "yellow",
-    }
-    color = palette.get(kind, "white")
-    bits = [f"[bold {color}]{kind:11s}[/bold {color}]", f"step {step}"]
-    bits.append(f"[bold]{actor}[/bold]")
-    for k, v in detail.items():
-        s = str(v)
-        if len(s) > 60:
-            s = s[:57] + "…"
-        bits.append(f"[dim]{k}=[/dim]{s}")
-    console.print(" ".join(bits))
+    color, glyph = _TRACE_PALETTE.get(kind, ("white", "·"))
+
+    summary = _summarise_event(kind, detail)
+    head = (
+        f"[{color}]{glyph}[/{color}] "
+        f"[bold {color}]{kind:11s}[/bold {color}] "
+        f"[dim]step[/dim] {step:<2} "
+        f"[bold]{actor:<10s}[/bold]"
+    )
+    if summary:
+        console.print(f"{head}  {summary}")
+    else:
+        # Generic fallback — show raw key=value detail.
+        bits = [head]
+        for k, v in detail.items():
+            s = str(v)
+            if len(s) > 60:
+                s = s[:57] + "…"
+            bits.append(f"[dim]{k}=[/dim]{s}")
+        console.print("  ".join(bits))
+
+
+def _summarise_event(kind: str, detail: dict) -> str:
+    """Produce a one-line human-readable summary per event kind."""
+    if kind == "verdict":
+        approved = detail.get("approved")
+        badge = (
+            "[green]✓ approved[/green]" if approved
+            else "[red]✗ rejected[/red]"
+        )
+        comment = (detail.get("comments") or "")[:80]
+        n_block = len(detail.get("blockers") or [])
+        rb = detail.get("route_back_to") or ""
+        out = f"{badge}  {comment}"
+        if not approved:
+            if n_block:
+                out += f"  [dim]· {n_block} blocker(s)[/dim]"
+            if rb:
+                out += f"  [dim]→ {rb}[/dim]"
+        return out
+    if kind == "review_round":
+        return (
+            f"round [bold]{detail.get('round','?')}[/bold]  "
+            f"[dim]· {detail.get('verdicts','?')} verdicts[/dim]"
+        )
+    if kind == "route_back":
+        return (
+            f"→ [bold]{detail.get('target','?')}[/bold]  "
+            f"[dim]· {detail.get('blockers','?')} blocker(s)[/dim]"
+        )
+    if kind == "applied":
+        n = detail.get("count", 0)
+        files = detail.get("files") or []
+        if not n:
+            return "[yellow]no diffs applied[/yellow]"
+        head = f"[green]{n}[/green] file(s)"
+        if files:
+            head += f"  [dim]· {', '.join(files[:3])}"
+            head += "…[/dim]" if len(files) > 3 else "[/dim]"
+        return head
+    if kind == "result":
+        approved = detail.get("approved")
+        n_applied = detail.get("applied_count", 0)
+        if approved is True and n_applied:
+            return f"[bold green]approved · applied {n_applied} file(s)[/bold green]"
+        if approved is True:
+            return "[bold yellow]approved · no diffs[/bold yellow]"
+        if approved is False:
+            return "[bold yellow]blocked by review[/bold yellow]"
+        return "[cyan]chain finished[/cyan]"
+    if kind == "discovery":
+        fields = detail.get("fields") or []
+        return f"[magenta]inspecting diffs[/magenta]  [dim]→ {', '.join(fields)}[/dim]"
+    if kind == "executor":
+        return f"[magenta]{detail.get('name','?')}[/magenta]  [dim]→ {', '.join(detail.get('fields',[])[:3])}[/dim]"
+    if kind == "llm_call":
+        prov = detail.get("provider", "")
+        model = detail.get("model", "")
+        sla = detail.get("sla_seconds")
+        sla_str = f"  [dim]· sla {sla}s[/dim]" if sla else ""
+        return f"[dim]{prov}/{model}[/dim]{sla_str}"
+    if kind == "llm_retry":
+        return (
+            f"[yellow]retrying[/yellow]  "
+            f"[dim]· {detail.get('reason','?')}[/dim]"
+        )
+    if kind == "outcome":
+        st = detail.get("status", "?")
+        dlg = detail.get("delegate_to")
+        out = f"status=[bold]{st}[/bold]"
+        if dlg:
+            out += f"  [dim]→ {dlg}[/dim]"
+        return out
+    if kind == "handoff_in":
+        return f"[dim]from[/dim] [bold]{detail.get('from','?')}[/bold]"
+    if kind == "batch_split":
+        return f"[blue]split into {detail.get('chunks','?')} chunks[/blue]"
+    if kind == "batch_chunk":
+        return f"[blue]chunk {detail.get('chunk','?')}/{detail.get('of','?')}[/blue]"
+    if kind == "pr_opened":
+        return f"[green]{detail.get('url','<none>')}[/green]"
+    return ""  # caller falls through to generic key=value rendering
 
 
 @app.command()

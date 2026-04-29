@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Chains · agentcore{% endblock %}
+{% block body_attrs %}data-refresh="10000"{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Chains</h1>
+    <p class="subtitle">Durable multi-hop agent tasks · refreshes every 10s</p>
+  </div>
+  <span class="badge badge-info">{{ chains|length }} tracked</span>
+</div>
+
+<section class="card">
+  {% if chains %}
+  <table>
+    <thead>
+      <tr><th>Chain ID</th><th>Status</th><th>Hops</th><th>Last agent</th><th>Updated</th></tr>
+    </thead>
+    <tbody>
+      {% for c in chains %}
+      <tr>
+        <td>
+          <a href="/ui/chains/{{ c.chain_id }}" class="mono small" style="text-decoration: none">
+            <code>{{ c.chain_id[:16] }}…</code>
+          </a>
+        </td>
+        <td><span class="badge badge-{{ c.status }}">{{ c.status }}</span></td>
+        <td class="mono">{{ c.hops|length if c.hops else 0 }}</td>
+        <td class="small">{% if c.hops %}{{ c.hops[-1].agent }}{% else %}—{% endif %}</td>
+        <td class="muted small nowrap">{{ c.updated_at or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No chains yet. Start one with <code>POST /run</code> or <code>agentcore plan "..."</code>.</div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}agentcore{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+  />
+  <link rel="stylesheet" href="{{ url_for('ui-static', path='/css/pico.min.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('ui-static', path='/css/shared.css') }}" />
+</head>
+<body {% block body_attrs %}{% endblock %}>
+  <header class="header">
+    <a href="{{ url_for('ui-dashboard') }}" class="brand">agentcore</a>
+    <nav>
+      <a href="{{ url_for('ui-dashboard') }}" {% if active == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
+      <a href="{{ url_for('ui-agents') }}" {% if active == 'agents' %}class="active"{% endif %}>Agents</a>
+      <a href="{{ url_for('ui-chains') }}" {% if active == 'chains' %}class="active"{% endif %}>Chains</a>
+      <a href="{{ url_for('ui-jobs') }}" {% if active == 'jobs' %}class="active"{% endif %}>Jobs</a>
+      <a href="{{ url_for('ui-graph') }}" {% if active == 'graph' %}class="active"{% endif %}>Graph</a>
+      {% if wiki_enabled %}
+      <a href="/ui/wiki" {% if active == 'wiki' %}class="active"{% endif %}>Wiki</a>
+      {% endif %}
+    </nav>
+    <div class="row">
+      <form method="get" style="margin: 0">
+        <select
+          name="project"
+          onchange="this.form.submit()"
+          class="mono"
+          style="padding: 4px 8px; font-size: 12px; min-width: 120px"
+          title="project_id — pick a tenant"
+        >
+          {% for p in projects %}
+            <option value="{{ p }}" {% if p == project %}selected{% endif %}>{{ p }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      <button data-theme-toggle class="outline" style="padding: 4px 10px" title="Toggle theme" aria-label="Toggle theme">
+        <i data-lucide="sun-moon" class="icon"></i>
+      </button>
+    </div>
+  </header>
+  <main class="container">{% block content %}{% endblock %}</main>
+  <script src="{{ url_for('ui-static', path='/js/lucide.min.js') }}"></script>
+  <script src="{{ url_for('ui-static', path='/js/app.js') }}"></script>
+</body>
+</html>

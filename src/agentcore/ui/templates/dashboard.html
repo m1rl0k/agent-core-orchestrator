@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · agentcore{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Dashboard</h1>
+    <p class="subtitle">Live status of the orchestrator for project <code>{{ project }}</code>.</p>
+  </div>
+  <div class="row">
+    <span class="badge badge-{% if health.ok %}ok{% else %}error{% endif %}">
+      <i data-lucide="heart-pulse" class="icon"></i>
+      {% if health.ok %}healthy{% else %}degraded{% endif %}
+    </span>
+    <span class="badge badge-muted mono">{{ host.os }}/{{ host.arch }}</span>
+  </div>
+</div>
+
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="label">Agents loaded</div>
+    <div class="value">{{ stats.agents_loaded }}</div>
+    {% if stats.agent_errors %}
+      <div class="hint" style="color: var(--danger)">{{ stats.agent_errors }} parse error(s)</div>
+    {% else %}
+      <div class="hint">0 parse errors</div>
+    {% endif %}
+  </div>
+  <div class="stat-card">
+    <div class="label">Jobs queued</div>
+    <div class="value">{{ stats.jobs_queued }}</div>
+    <div class="hint">{{ stats.jobs_running }} running · {{ stats.jobs_dead }} dead-letter</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Chains (24h)</div>
+    <div class="value">{{ stats.chains_24h }}</div>
+    <div class="hint">{{ stats.chains_active }} in-flight</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Wiki pages</div>
+    <div class="value">{{ stats.wiki_pages if wiki_enabled else "—" }}</div>
+    <div class="hint">{% if wiki_enabled %}indexed · {{ stats.wiki_stale }} stale{% else %}disabled{% endif %}</div>
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-title">
+    <h2>Capabilities</h2>
+    <span class="muted small">host-credentialed integrations</span>
+  </div>
+  {% if capabilities %}
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Status</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+      {% for name, cap in capabilities.items() %}
+      <tr>
+        <td><code>{{ name }}</code></td>
+        <td><span class="badge badge-{{ cap.status }}">{{ cap.status }}</span></td>
+        <td class="muted small">{{ cap.detail or cap.install_hint or cap.auth_hint or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No capabilities configured. Set <code>AGENTCORE_ENABLE_GITHUB=true</code> (or AWS/Azure) to enable.</div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-title">
+    <h2>Recent activity</h2>
+    <a href="{{ url_for('ui-chains') }}" class="small muted">View all →</a>
+  </div>
+  {% if recent_chains %}
+  <table>
+    <thead>
+      <tr><th>Chain</th><th>Status</th><th>Hops</th><th>Last seen</th></tr>
+    </thead>
+    <tbody>
+      {% for c in recent_chains %}
+      <tr>
+        <td><code>{{ c.chain_id[:12] }}…</code></td>
+        <td><span class="badge badge-{{ c.status }}">{{ c.status }}</span></td>
+        <td class="mono">{{ c.hops|length if c.hops else 0 }}</td>
+        <td class="muted small nowrap">{{ c.updated_at or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No chains yet. Run <code>agentcore plan "..."</code> or POST to <code>/run</code>.</div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -8,7 +8,11 @@ llm:
   provider: bedrock
   model: moonshot.kimi-k2-thinking
   temperature: 0.1
-  max_tokens: 8192
+  # Generous output budget. Multi-file diffs (e.g. fix + validation
+  # across functions + new function + tests + scaffolding) routinely
+  # exceed 8k tokens once unified-diff overhead is counted; truncation
+  # silently drops contract-required fields.
+  max_tokens: 32768
 
 soul:
   role: developer

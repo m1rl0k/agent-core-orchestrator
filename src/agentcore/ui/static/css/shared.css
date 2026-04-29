@@ -1,0 +1,259 @@
+/* agentcore — overrides on Pico CSS.
+   Classless-first: Pico styles semantic HTML; shared.css adds what
+   the dashboard needs on top (tables with status badges, stat cards,
+   sticky header, code blocks). */
+
+/* ── Tokens ── */
+:root {
+  --pico-font-family: "Space Grotesk", system-ui, -apple-system, sans-serif;
+  --pico-font-family-monospace: "IBM Plex Mono", ui-monospace, monospace;
+  --pico-font-size: 14px;
+  --pico-line-height: 1.6;
+  --pico-primary: #00b894;
+  --pico-primary-hover: #00d1a7;
+  --pico-primary-focus: rgba(0, 184, 148, 0.25);
+  --pico-border-radius: 8px;
+  --accent: #00b894;
+  --accent-hover: #00d1a7;
+  --accent-soft: rgba(0, 184, 148, 0.12);
+  --success: #16a34a;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --muted: #64748b;
+  --font-mono: var(--pico-font-family-monospace);
+  --radius: 8px;
+  --radius-lg: 12px;
+  --transition: 150ms ease;
+}
+[data-theme="light"] {
+  --pico-primary: #00b894;
+  --pico-primary-hover: #009b7f;
+}
+
+/* ── Base ── */
+body {
+  font-size: 14px;
+}
+h1 { font-size: 1.75rem; letter-spacing: -0.02em; margin: 0; }
+h2 { font-size: 1.25rem; letter-spacing: -0.01em; margin: 0 0 12px; }
+h3 { font-size: 1.05rem; margin: 0 0 8px; }
+
+/* Pico full-width buttons are wrong for a dashboard. */
+button, [type="submit"], [type="button"], [role="button"],
+a[role="button"], input[type="submit"] {
+  width: auto;
+}
+
+/* ── Layout ── */
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--pico-background-color);
+  border-bottom: 1px solid var(--pico-muted-border-color);
+}
+.header .brand {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 15px;
+  text-decoration: none;
+  color: var(--pico-color);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.header .brand::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.header nav {
+  display: flex;
+  gap: 4px;
+}
+.header nav a {
+  padding: 6px 12px;
+  border-radius: 6px;
+  text-decoration: none;
+  color: var(--muted);
+  font-size: 13px;
+  transition: var(--transition);
+}
+.header nav a:hover {
+  color: var(--pico-color);
+  background: var(--pico-card-background-color);
+}
+.header nav a.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+main.container {
+  padding: 20px;
+  max-width: 1280px;
+}
+
+.page-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.page-header .subtitle {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 0;
+}
+
+/* ── Stat cards ── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  padding: 14px 16px;
+  border: 1px solid var(--pico-muted-border-color);
+  border-radius: var(--radius);
+  background: var(--pico-card-background-color);
+}
+.stat-card .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.stat-card .value {
+  font-size: 24px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  line-height: 1.1;
+}
+.stat-card .hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* ── Tables ── */
+table {
+  margin: 0;
+}
+table code, td code, .mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--pico-code-background-color);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+/* ── Badges ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.badge-ok, .badge-done, .badge-running, .badge-ready {
+  background: rgba(22, 163, 74, 0.15);
+  color: var(--success);
+}
+.badge-queued, .badge-pending {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+}
+.badge-failed, .badge-dead, .badge-error, .badge-cancelled {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+}
+.badge-delegated, .badge-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.badge-missing, .badge-unauthed, .badge-off, .badge-muted {
+  background: var(--pico-code-background-color);
+  color: var(--muted);
+}
+
+/* ── Section / card ── */
+.card, section.card {
+  padding: 16px;
+  border: 1px solid var(--pico-muted-border-color);
+  border-radius: var(--radius);
+  background: var(--pico-card-background-color);
+  margin-bottom: 16px;
+}
+.card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.card-title h2, .card-title h3 {
+  margin: 0;
+}
+
+/* ── Empty state ── */
+.empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--pico-muted-border-color);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+/* ── Code / markdown ── */
+pre {
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 420px;
+  overflow: auto;
+}
+
+/* ── Utilities ── */
+.row { display: flex; align-items: center; gap: 8px; }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--font-mono); }
+.small { font-size: 12px; }
+.nowrap { white-space: nowrap; }
+.truncate {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: bottom;
+}
+
+/* Lucide icons inline with text */
+.icon {
+  width: 14px;
+  height: 14px;
+  vertical-align: -2px;
+}

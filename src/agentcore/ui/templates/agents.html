@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Agents · agentcore{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Agents</h1>
+    <p class="subtitle">Loaded from <code>{{ agents_dir }}</code>. Hot-reloads on file change.</p>
+  </div>
+  <span class="badge badge-info">{{ agents|length }} loaded</span>
+</div>
+
+{% if errors %}
+<section class="card" style="border-color: var(--danger)">
+  <div class="card-title">
+    <h3 style="color: var(--danger)"><i data-lucide="alert-triangle" class="icon"></i> Parse errors</h3>
+  </div>
+  <table>
+    <thead><tr><th>File</th><th>Error</th></tr></thead>
+    <tbody>
+      {% for path, err in errors.items() %}
+      <tr><td><code>{{ path }}</code></td><td class="small">{{ err }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section class="card">
+  {% if agents %}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Provider / model</th>
+        <th>Accepts</th>
+        <th>Delegates</th>
+        <th>SLA</th>
+        <th>Source</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in agents %}
+      <tr>
+        <td><strong>{{ a.name }}</strong><div class="muted small">{{ a.description }}</div></td>
+        <td><code>{{ a.provider }}</code> / <code>{{ a.model }}</code></td>
+        <td class="small">{{ a.accepts_from|join(', ') or '—' }}</td>
+        <td class="small">{{ a.delegates_to|join(', ') or '—' }}</td>
+        <td class="mono small">{{ a.sla_seconds or '—' }}s</td>
+        <td><code class="truncate">{{ a.source_path }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No agents loaded. Drop <code>*.agent.md</code> files into <code>{{ agents_dir }}</code>.</div>
+  {% endif %}
+</section>
+{% endblock %}

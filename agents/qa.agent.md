@@ -8,7 +8,11 @@ llm:
   provider: bedrock
   model: moonshot.kimi-k2-thinking
   temperature: 0.1
-  max_tokens: 6144
+  # Generous budget — QA curates raw runner output (potentially long
+  # stdout/stderr tails), enumerates passed/failed test names, and
+  # writes a discriminating suite_summary. Truncation here drops
+  # required fields silently.
+  max_tokens: 16384
 
 soul:
   role: qa

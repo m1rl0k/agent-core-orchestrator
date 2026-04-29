@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ page.title or page.rel }} · Wiki{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>{{ page.title or page.rel }}</h1>
+    <p class="subtitle">
+      <a href="{{ url_for('ui-wiki') }}{% if request.query_params.get('project') %}?project={{ request.query_params.get('project') }}{% endif %}">
+        ← all pages
+      </a>
+      · <code>{{ page.rel }}</code>
+      {% if page.frontmatter.get("status") %}
+        · <span class="badge">{{ page.frontmatter.status }}</span>
+      {% endif %}
+    </p>
+  </div>
+  <div class="row">
+    {% if page.sources %}
+    <span class="badge">{{ page.sources|length }} source(s)</span>
+    {% endif %}
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-title">
+    <h2 style="margin: 0">Content</h2>
+    <span class="muted small">rendered markdown</span>
+  </div>
+  <div class="prose">
+    {{ rendered_html | safe }}
+  </div>
+</section>
+
+{% if page.sources %}
+<section class="card">
+  <div class="card-title">
+    <h2 style="margin: 0">Sources</h2>
+    <span class="muted small">files this page derives from</span>
+  </div>
+  <table>
+    <thead><tr><th>Path</th></tr></thead>
+    <tbody>
+      {% for s in page.sources %}
+      <tr><td><code>{{ s }}</code></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if page.frontmatter %}
+<section class="card">
+  <details>
+    <summary>frontmatter ({{ page.frontmatter|length }} fields)</summary>
+    <pre style="margin-top: 12px; font-size: 11px; overflow-x: auto"><code>{{ page.frontmatter | tojson(indent=2) }}</code></pre>
+  </details>
+</section>
+{% endif %}
+{% endblock %}
