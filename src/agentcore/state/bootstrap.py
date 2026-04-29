@@ -127,7 +127,6 @@ def verify_schema(
 
     try:
         from alembic.config import Config
-        from alembic.runtime.migration import MigrationContext
         from alembic.script import ScriptDirectory
     except ImportError:
         log.info("schema.alembic_unavailable")
@@ -143,9 +142,12 @@ def verify_schema(
 
     current: str | None = None
     try:
-        with psycopg.connect(settings.pg_dsn, autocommit=True) as conn:
-            ctx = MigrationContext.configure(conn.cursor())
-            current = ctx.get_current_revision()
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute("SELECT version_num FROM alembic_version LIMIT 1")
+            row = cur.fetchone()
+            current = str(row[0]) if row else None
+    except psycopg.errors.UndefinedTable:
+        current = None
     except Exception as exc:
         log.warning("schema.current_unreadable", error=str(exc))
         # Can't read DB — don't block startup; ensure_postgres handles

@@ -143,7 +143,7 @@ class VectorStore:
             return 0
         sql = (
             "INSERT INTO agentcore_chunks (collection, ref, content, metadata, embedding) "
-            "VALUES (%s, %s, %s, %s::jsonb, %s) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s::vector) "
             "ON CONFLICT (collection, ref) DO UPDATE SET "
             "content = EXCLUDED.content, "
             "metadata = EXCLUDED.metadata, "
@@ -158,9 +158,9 @@ class VectorStore:
     def search(self, collection: str, query_emb: list[float], k: int = 8) -> list[Hit]:
         sql = (
             "SELECT ref, content, metadata, "
-            "  1 - (embedding <=> %s) AS score "
+            "  1 - (embedding <=> %s::vector) AS score "
             "FROM agentcore_chunks WHERE collection = %s "
-            "ORDER BY embedding <=> %s LIMIT %s"
+            "ORDER BY embedding <=> %s::vector LIMIT %s"
         )
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(sql, (query_emb, collection, query_emb, k))

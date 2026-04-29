@@ -15,6 +15,10 @@ def configure_logging(level: str = "info") -> None:
         stream=sys.stdout,
         level=log_level,
     )
+    # Botocore logs credential-token discovery at INFO. That is useful
+    # for AWS SDK debugging but noisy in normal agent runs, especially
+    # when Bedrock bearer-token auth is configured.
+    logging.getLogger("botocore.tokens").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

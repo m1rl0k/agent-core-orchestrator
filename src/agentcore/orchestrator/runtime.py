@@ -236,6 +236,41 @@ class Runtime:
                 )
                 raise
 
+        # 4b. Edit-validation. Two shapes are accepted:
+        #
+        #     * `file_ops` — preferred, structured. We dry-run them
+        #       against an in-memory copy of the live tree to catch
+        #       missing-file / ambiguous-`old` errors at the source.
+        #     * `diffs` — legacy unified diffs. `git apply --check`
+        #       in a temp worktree.
+        #
+        #     If either fails, re-ask the dev with the specific error
+        #     so it corrects course on its own hop instead of burning
+        #     review rounds on the same class of bug. If both are
+        #     present, file_ops wins (preferred shape).
+        bad: list[dict[str, str]] = []
+        if output.get("file_ops"):
+            bad = self._check_file_ops(output["file_ops"])
+        elif output.get("diffs"):
+            bad = await self._check_diffs(output["diffs"])
+        if bad:
+            self._record(
+                handoff.task_id, handoff.step, "llm_retry", spec.name,
+                {"reason": "bad_edit", "errors": bad[:3]},
+            )
+            output = await self._reask_with_diff_errors(spec, handoff, bad)
+            try:
+                validate_payload(
+                    spec.contract.outputs, output,
+                    agent=spec.name, direction="output",
+                )
+            except ContractViolation as exc:
+                self._record(
+                    handoff.task_id, handoff.step, "error", spec.name,
+                    {"contract": exc.errors, "raw": str(output)[:1000]},
+                )
+                raise
+
         # 5. Outcome
         delegate_to = self._infer_delegation(spec, output)
         outcome = Outcome(
@@ -283,11 +318,21 @@ class Runtime:
         from agentcore.runtime.sandbox import run_in_worktree
 
         diffs = handoff.payload.get("diffs") or []
-        if not diffs:
+        file_ops = handoff.payload.get("file_ops") or []
+        if not diffs and not file_ops:
             return {}
 
-        # Compact the diffs into a sketch the LLM can scan quickly.
+        # Compact the edits into a sketch the LLM can scan quickly.
+        # FileOps preview cleaner than unified diffs.
         sketch: list[dict[str, Any]] = []
+        for op in file_ops[:20]:
+            if not isinstance(op, dict):
+                continue
+            sketch.append({
+                "path": op.get("path"),
+                "action": op.get("action"),
+                "preview": "\n".join((op.get("content") or op.get("new") or "").splitlines()[:30]),
+            })
         for d in diffs[:20]:
             if not isinstance(d, dict):
                 continue
@@ -367,6 +412,7 @@ class Runtime:
                 run = await run_in_worktree(
                     list(cmd),
                     diffs=diffs,
+                    file_ops=file_ops,
                     repo_root=handoff.payload.get("repo_root"),
                     timeout_seconds=600,
                 )
@@ -394,6 +440,197 @@ class Runtime:
             "test_run": last_run or {},
             "test_attempts": attempts,
         }
+
+    def _check_file_ops(
+        self, file_ops: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """Dry-run validation of structured file_ops against the live
+        repo. Cheap (read-only checks; no temp worktree required).
+        Returns `[{path, error}]` for any op that would fail.
+        """
+        import os
+
+        if not file_ops:
+            return []
+        repo = Path(os.environ.get("AGENTCORE_REPO_ROOT", ".")).resolve()
+        bad: list[dict[str, str]] = []
+        for op in file_ops:
+            if not isinstance(op, dict):
+                bad.append({"path": "?", "error": "op is not a dict"})
+                continue
+            action = (op.get("action") or "").strip().lower()
+            rel = op.get("path") or "?"
+            target = (repo / rel).resolve() if rel != "?" else repo
+            try:
+                target.relative_to(repo)
+            except ValueError:
+                bad.append({"path": rel, "error": "path escapes repo root"})
+                continue
+            if action not in ("create", "replace", "edit", "delete"):
+                bad.append({
+                    "path": rel,
+                    "error": (
+                        f"unknown action {action!r} "
+                        "(must be create|replace|edit|delete)"
+                    ),
+                })
+                continue
+            if action == "create":
+                if op.get("content") is None:
+                    bad.append({"path": rel, "error": "create missing `content`"})
+                if target.exists():
+                    bad.append({
+                        "path": rel,
+                        "error": f"create: {rel} already exists; use action='replace' to overwrite",
+                    })
+            elif action == "replace":
+                if op.get("content") is None:
+                    bad.append({"path": rel, "error": "replace missing `content`"})
+            elif action == "edit":
+                if not target.exists():
+                    bad.append({"path": rel, "error": f"edit: {rel} does not exist"})
+                    continue
+                old = op.get("old") or ""
+                if not old:
+                    bad.append({"path": rel, "error": "edit missing `old`"})
+                    continue
+                try:
+                    body = target.read_text(encoding="utf-8")
+                except OSError as exc:
+                    bad.append({"path": rel, "error": f"read failed: {exc}"})
+                    continue
+                count = body.count(old)
+                if count == 0:
+                    bad.append({
+                        "path": rel,
+                        "error": (
+                            f"edit: `old` text not found in {rel}; "
+                            "include the literal current contents"
+                        ),
+                    })
+                elif count > 1:
+                    bad.append({
+                        "path": rel,
+                        "error": (
+                            f"edit: `old` matches {count} times in {rel}; "
+                            "include more surrounding context to make it unique"
+                        ),
+                    })
+            # delete is permissive — missing path is a no-op, not an error.
+        return bad
+
+    async def _check_diffs(
+        self, diffs: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """Run `git apply --check` against every diff. Returns a list
+        of `{path, error}` entries for diffs that fail. Empty list when
+        every diff is well-formed and applies cleanly to the live repo.
+
+        Done in a temp git worktree so we never touch the user's tree
+        and so the check is non-destructive even if a diff would
+        partially apply.
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not diffs:
+            return []
+        repo = Path(
+            os.environ.get("AGENTCORE_REPO_ROOT", ".")
+        ).resolve()
+        if not (repo / ".git").is_dir():
+            return []  # No repo to check against — let downstream find out.
+
+        sandbox = Path(tempfile.mkdtemp(prefix="agentcore-diffcheck-"))
+        bad: list[dict[str, str]] = []
+        wt = sandbox / "wt"
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt)],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode != 0:
+                return []  # Couldn't set up — fail open.
+
+            for d in diffs:
+                if not isinstance(d, dict):
+                    continue
+                path = d.get("path", "?")
+                diff_text = d.get("unified_diff") or ""
+                if not diff_text.strip():
+                    bad.append({
+                        "path": str(path),
+                        "error": "unified_diff is empty",
+                    })
+                    continue
+                patch = wt / ".agentcore.check.patch"
+                patch.write_text(diff_text, encoding="utf-8")
+                try:
+                    proc = subprocess.run(
+                        ["git", "-C", str(wt), "apply", "--check",
+                         "--whitespace=nowarn", str(patch)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or proc.stdout
+                               or "git apply --check failed").strip()
+                        bad.append({
+                            "path": str(path),
+                            "error": err[:400],
+                        })
+                finally:
+                    with contextlib.suppress(OSError):
+                        patch.unlink()
+        finally:
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["git", "-C", str(repo), "worktree", "remove",
+                     "--force", str(wt)],
+                    capture_output=True, check=False,
+                )
+            shutil.rmtree(sandbox, ignore_errors=True)
+        return bad
+
+    async def _reask_with_diff_errors(
+        self,
+        spec: AgentSpec,
+        handoff: Handoff,
+        bad: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Re-ask the agent after one or more diffs failed to apply.
+
+        Hands back the exact `git apply --check` error per file so the
+        model can correct context anchors / file headers / line numbers
+        instead of guessing what went wrong.
+        """
+        messages = await self._render_messages(spec, handoff)
+        bullets = "\n".join(
+            f"  - {b['path']}: {b['error']}" for b in bad[:10]
+        )
+        nudge = (
+            "Your previous response had diffs that FAIL `git apply --check`. "
+            "Errors below — fix the unified-diff syntax (preserve `def` / "
+            "header lines as context, correct hunk line numbers, ensure "
+            "`--- /dev/null` for new files, exact `--- a/path` / `+++ b/path` "
+            "headers, no trailing whitespace). Re-emit the JSON with corrected "
+            "diffs.\n\n"
+            f"{bullets}\n\n"
+            "Reply ONLY with the corrected JSON object."
+        )
+        messages = [*messages, ChatMessage(role="user", content=nudge)]
+        try:
+            if spec.contract.sla_seconds:
+                resp = await asyncio.wait_for(
+                    self.router.complete(messages, spec.llm),
+                    timeout=float(spec.contract.sla_seconds),
+                )
+            else:
+                resp = await self.router.complete(messages, spec.llm)
+        except TimeoutError as exc:
+            raise SLAExceeded(spec.name, spec.contract.sla_seconds) from exc
+        return self._parse_json_block(resp.text)
 
     async def _reask_with_contract(
         self, spec: AgentSpec, handoff: Handoff, err: ContractViolation,

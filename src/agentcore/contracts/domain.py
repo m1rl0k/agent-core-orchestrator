@@ -93,6 +93,54 @@ class FileDiff(BaseModel):
     unified_diff: str
 
 
+class FileOp(BaseModel):
+    """Structured file operation — preferred over unified diffs.
+
+    LLMs are unreliable emitters of unified-diff syntax (drop context
+    lines, get hunk anchors wrong, mishandle new files). FileOp lets
+    the agent express intent directly:
+
+      - create  : `path` + `content` (full new file)
+      - replace : `path` + `content` (overwrite existing file)
+      - edit    : `path` + `old` + `new` (one search-replace pair;
+                  `old` MUST appear exactly once in the file or the
+                  runtime rejects the op)
+      - delete  : `path` only
+
+    The runtime applies these atomically per op against the live tree
+    (or a sandboxed worktree for QA). Failure modes are explicit:
+    `old` not found, `old` ambiguous, target missing for replace/edit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["create", "replace", "edit", "delete"]
+    path: str
+    content: str | None = None
+    old: str | None = None
+    new: str | None = None
+    rationale: str = ""
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalise_action(cls, v: object) -> object:
+        if isinstance(v, str):
+            alias = {
+                "write": "create",
+                "new": "create",
+                "add": "create",
+                "overwrite": "replace",
+                "modify": "edit",
+                "update": "edit",
+                "change": "edit",
+                "patch": "edit",
+                "remove": "delete",
+                "rm": "delete",
+            }
+            return alias.get(v.strip().lower(), v.strip().lower())
+        return v
+
+
 class ImplementationPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -234,6 +282,7 @@ DOMAIN_TYPES: dict[str, type[BaseModel]] = {
     "FileChange": FileChange,
     "TechnicalPlan": TechnicalPlan,
     "FileDiff": FileDiff,
+    "FileOp": FileOp,
     "ImplementationPatch": ImplementationPatch,
     "TestCase": TestCase,
     "TestSuite": TestSuite,

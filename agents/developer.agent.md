@@ -32,7 +32,11 @@ contract:
     - { name: context,         type: ContextBundle, required: false }
   outputs:
     - { name: plan_summary, type: string,             required: true,  description: "Echo of the plan summary you implemented" }
-    - { name: diffs,        type: "list[FileDiff]",   required: true,  description: "List of FileDiff objects (path + unified_diff)" }
+    # PREFERRED: structured file operations. The runtime applies them
+    # directly — no fragile unified-diff syntax. One of `file_ops` or
+    # `diffs` must be non-empty.
+    - { name: file_ops,     type: "list[FileOp]",     required: false, description: "Structured edits: action create|replace|edit|delete + path + (content | old/new). Preferred over diffs." }
+    - { name: diffs,        type: "list[FileDiff]",   required: false, description: "Legacy: list of FileDiff objects (path + unified_diff). Use file_ops instead when possible." }
     - { name: notes,        type: string,             required: false, description: "Implementation notes for QA / Architect" }
   # Peer mesh on the receive side: any role can route a revision to
   # developer (qa: failing test; ops: shipping concern; architect:
@@ -130,14 +134,31 @@ patch is self-contained.
 - Secrets via the project's existing env/secret mechanism — never
   inline.
 
-## Diff Discipline
+## File operations — preferred output
 
-- Unified diff format only — no full-file rewrites unless the file
-  is new or >90% changed.
-- Context anchors must match real lines; if you approximate, note
-  it so QA's sandbox can recover.
-- One file per diff block; tests in their own diff block.
-- No `--no-verify`, no force-pushes, no rewriting history.
+Emit `file_ops[]` with structured edits the runtime can apply
+directly. Each op is one of:
+
+- **create** — `{action: "create", path, content, rationale}` for new
+  files. Provide the full intended content. Use this for tests,
+  scaffolding, configs, anything that doesn't already exist.
+- **replace** — `{action: "replace", path, content, rationale}` for
+  files where >90% of the body changes. Provide the full new content.
+- **edit** — `{action: "edit", path, old, new, rationale}` for
+  surgical changes. `old` MUST appear EXACTLY ONCE in the file —
+  include enough surrounding context to make it unique. The runtime
+  rejects ambiguous or missing `old`.
+- **delete** — `{action: "delete", path, rationale}`.
+
+This is the preferred shape because it's robust against the LLM emit
+errors that plague unified diffs (missing context lines, wrong hunk
+anchors, mishandled new files).
+
+### Legacy: unified diffs (`diffs[]`)
+
+Only use when you have a strong reason. Same correctness rules apply:
+context anchors must match real lines; one file per diff block; no
+`--no-verify`, no force-pushes, no rewriting history.
 
 ## Red Flags
 

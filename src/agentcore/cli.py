@@ -549,12 +549,24 @@ async def _plan_async_body(
 
     applied: list[str] = []
     if apply and state.get("developer_output"):
-        diffs = state["developer_output"].get("diffs") or []
-        applied = _apply_diffs(repo, diffs)
+        dev = state["developer_output"]
+        # Prefer structured file_ops over fragile unified diffs. Either
+        # is acceptable; if both are present, file_ops wins.
+        file_ops = dev.get("file_ops") or []
+        diffs = dev.get("diffs") or []
+        try:
+            if file_ops:
+                from agentcore.runtime.sandbox import apply_file_ops
+                applied = apply_file_ops(repo.resolve(), file_ops)
+            else:
+                applied = _apply_diffs(repo, diffs)
+        except Exception as exc:
+            console.print(f"[red]apply failed:[/red] {exc}")
+            applied = []
         if applied:
             console.print(f"[green]applied {len(applied)} file(s):[/green] " + ", ".join(applied))
         else:
-            console.print("[yellow]no diffs applied[/yellow]")
+            console.print("[yellow]no edits applied[/yellow]")
         traces.record(TraceEvent(
             task_id=task_id, step=99, kind="applied", actor="cli",
             detail={"count": len(applied), "files": applied[:20]},
@@ -1060,51 +1072,56 @@ def _synthesize_handoff_payload(
 
 
 def _apply_diffs(repo: Path, diffs: list[dict]) -> list[str]:
-    """Apply each FileDiff via `git apply`. Falls back to direct overwrite for
-    diffs whose context anchors don't match the file (LLMs sometimes invent
-    context lines). Returns the list of paths actually written.
+    """Apply FileDiff objects to the real repo using `git apply`.
+
+    Invalid diffs fail explicitly. We never reconstruct files from `+`
+    lines because that corrupts source when context is wrong.
     """
     repo = Path(repo).resolve()
-    written: list[str] = []
+    patches: list[tuple[str, str]] = []
+    patch_paths: list[str] = []
     for d in diffs:
         path = d.get("path") if isinstance(d, dict) else None
         diff_text = d.get("unified_diff") if isinstance(d, dict) else None
-        if not path or not diff_text:
-            continue
-        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as tmp:
-            tmp.write(diff_text)
-            patch_path = tmp.name
-        try:
-            check = subprocess.run(
-                ["git", "-C", str(repo), "apply", "--check", patch_path],
-                capture_output=True,
-                text=True,
+        if path and diff_text:
+            patches.append((str(path), str(diff_text)))
+    if not patches:
+        return []
+
+    try:
+        for _, diff_text in patches:
+            with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as tmp:
+                tmp.write(diff_text)
+                patch_paths.append(tmp.name)
+
+        check = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--recount", "--check", *patch_paths],
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode != 0:
+            console.print(
+                "[red]diff apply check failed; no files modified:[/red] "
+                + (check.stderr or check.stdout or "git apply --check failed").strip()
             )
-            if check.returncode == 0:
-                applied = subprocess.run(
-                    ["git", "-C", str(repo), "apply", patch_path],
-                    capture_output=True,
-                    text=True,
-                )
-                if applied.returncode == 0:
-                    written.append(path)
-                    continue
-            # Fallback: extract the post-image (every line starting with '+'
-            # except '+++') and overwrite the file. Lossy but functional when
-            # the LLM gave us a diff with bad context but a clear new state.
-            new_lines = [
-                line[1:] for line in diff_text.splitlines()
-                if line.startswith("+") and not line.startswith("+++")
-            ]
-            if new_lines:
-                target = repo / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                written.append(path + " (overwrite-fallback)")
-        finally:
+            return []
+
+        applied = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--recount", *patch_paths],
+            capture_output=True,
+            text=True,
+        )
+        if applied.returncode != 0:
+            console.print(
+                "[red]diff apply failed; no fallback overwrite attempted:[/red] "
+                + (applied.stderr or applied.stdout or "git apply failed").strip()
+            )
+            return []
+        return [path for path, _ in patches]
+    finally:
+        for patch_path in patch_paths:
             with contextlib.suppress(OSError):
                 Path(patch_path).unlink()
-    return written
 
 
 def _open_github_pr(
@@ -1198,15 +1215,23 @@ def tail(
         headers["Authorization"] = f"Bearer {settings.api_token}"
 
     local_path = Path.home() / ".agentcore" / "traces" / f"{chain_id}.jsonl"
+    if local_path.exists():
+        console.print(
+            Panel(
+                f"[bold cyan]chain[/bold cyan] {chain_id}\n"
+                f"[bold cyan]source[/bold cyan] local file [dim]({local_path})[/dim]",
+                title="agentcore · tail",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        )
+        _tail_local(local_path, interval=interval)
+        return
 
     console.print(
         Panel(
             f"[bold cyan]chain[/bold cyan] {chain_id}\n"
-            f"[bold cyan]source[/bold cyan] http {base}"
-            + (
-                f" [dim](local fallback: {local_path})[/dim]"
-                if local_path.exists() else ""
-            ),
+            f"[bold cyan]source[/bold cyan] http {base}",
             title="agentcore · tail",
             border_style="cyan",
             padding=(0, 1),

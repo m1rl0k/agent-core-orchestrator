@@ -38,7 +38,8 @@ log = structlog.get_logger(__name__)
 async def run_in_worktree(
     command: list[str],
     *,
-    diffs: list[dict[str, Any]],
+    diffs: list[dict[str, Any]] | None = None,
+    file_ops: list[dict[str, Any]] | None = None,
     repo_root: str | Path | None = None,
     timeout_seconds: int = 600,
     artifact: str | None = None,
@@ -81,7 +82,16 @@ async def run_in_worktree(
                 note=f"git worktree add failed: {err[:200]}",
             )
 
-        applied = apply_in_worktree(wt, diffs)
+        try:
+            # FileOp wins when present — it's the preferred shape and
+            # is non-fragile. Fall back to unified diffs only when no
+            # file_ops were provided.
+            if file_ops:
+                applied = apply_file_ops(wt, file_ops)
+            else:
+                applied = apply_in_worktree(wt, diffs or [])
+        except PatchApplyError as exc:
+            return _result("error", command=command, note=str(exc))
 
         rc, out, err = await _run(command, cwd=wt, timeout=timeout_seconds)
         artifact_data: dict[str, Any] | None = None
@@ -124,13 +134,17 @@ async def run_in_worktree(
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+class PatchApplyError(RuntimeError):
+    """Raised when an agent emits a diff that cannot be applied cleanly."""
+
+
 def apply_in_worktree(
     wt: Path, diffs: list[dict[str, Any]]
 ) -> list[str]:
-    """Apply each FileDiff via `git apply` inside `wt`. On context
-    mismatch (LLMs sometimes invent context lines), fall back to
-    raw post-image overwrite. Returns the list of paths actually
-    written.
+    """Apply each FileDiff via `git apply` inside `wt`.
+
+    Invalid diffs fail explicitly. We never reconstruct files from `+`
+    lines because that corrupts real source when context is wrong.
     """
     import subprocess
 
@@ -144,28 +158,104 @@ def apply_in_worktree(
             continue
         patch = wt / ".agentcore.patch"
         patch.write_text(diff_text, encoding="utf-8")
-        proc = subprocess.run(
-            ["git", "-C", str(wt), "apply", "--whitespace=nowarn", str(patch)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode == 0:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(wt), "apply", "--recount", "--whitespace=nowarn", str(patch)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "git apply failed").strip()
+                raise PatchApplyError(f"failed to apply diff for {path}: {err[:500]}")
             applied.append(path)
-        else:
-            new_lines = [
-                ln[1:] for ln in diff_text.splitlines()
-                if ln.startswith("+") and not ln.startswith("+++")
-            ]
-            if new_lines:
-                target = wt / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(
-                    "\n".join(new_lines) + "\n", encoding="utf-8"
+        finally:
+            with contextlib.suppress(OSError):
+                patch.unlink()
+    return applied
+
+
+def apply_file_ops(
+    root: Path, file_ops: list[dict[str, Any]]
+) -> list[str]:
+    """Apply structured FileOp entries to `root`. Each op is one of:
+
+      create  — write full content; fails if path already exists
+      replace — overwrite full content; creates parent dirs as needed
+      edit    — search-replace `old` -> `new`; `old` must appear
+                exactly once in the existing file
+      delete  — remove file (no error if missing)
+
+    Returns the list of paths actually touched. Raises `PatchApplyError`
+    on any unsatisfiable op (e.g. `old` not found, `old` ambiguous,
+    missing target for replace/edit) — the agent must produce a clean
+    follow-up rather than risk silent corruption.
+    """
+    applied: list[str] = []
+    for op in file_ops or []:
+        if not isinstance(op, dict):
+            continue
+        action = (op.get("action") or "").strip().lower()
+        rel = op.get("path")
+        if not rel:
+            continue
+        target = (root / rel).resolve()
+        # Path safety — must be inside `root`.
+        try:
+            target.relative_to(root.resolve())
+        except ValueError as exc:
+            raise PatchApplyError(
+                f"path escapes root: {rel!r}"
+            ) from exc
+
+        if action == "create":
+            content = op.get("content") or ""
+            if target.exists():
+                raise PatchApplyError(
+                    f"create failed: {rel!r} already exists "
+                    "(use action='replace' to overwrite)"
                 )
-                applied.append(path + " (overwrite-fallback)")
-        with contextlib.suppress(OSError):
-            patch.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            applied.append(str(rel))
+        elif action == "replace":
+            content = op.get("content") or ""
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            applied.append(str(rel))
+        elif action == "edit":
+            old = op.get("old") or ""
+            new = op.get("new") or ""
+            if not target.exists():
+                raise PatchApplyError(
+                    f"edit failed: {rel!r} does not exist"
+                )
+            if not old:
+                raise PatchApplyError(
+                    f"edit failed: {rel!r} `old` is empty"
+                )
+            body = target.read_text(encoding="utf-8")
+            count = body.count(old)
+            if count == 0:
+                raise PatchApplyError(
+                    f"edit failed: `old` not found in {rel!r}"
+                )
+            if count > 1:
+                raise PatchApplyError(
+                    f"edit failed: `old` is ambiguous in {rel!r} "
+                    f"({count} matches; include more surrounding context)"
+                )
+            target.write_text(body.replace(old, new, 1), encoding="utf-8")
+            applied.append(str(rel))
+        elif action == "delete":
+            if target.exists():
+                target.unlink()
+                applied.append(str(rel))
+        else:
+            raise PatchApplyError(
+                f"unknown action {action!r} for {rel!r} "
+                "(must be create|replace|edit|delete)"
+            )
     return applied
 
 

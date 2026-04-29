@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agentcore.adapters.graphify import GraphifyAdapter
 from agentcore.capabilities import detect_capabilities
@@ -73,11 +74,129 @@ class RunResponse(BaseModel):
 
 
 class SignalIn(BaseModel):
+    id: str | None = None
     source: str
     kind: str
     target: str
     severity: str = "info"
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+def _signal_payload(sig: SignalIn) -> dict[str, Any]:
+    """Return the contract-shaped Signal payload Ops expects."""
+    data = sig.model_dump(exclude_none=True)
+    data.setdefault("id", new_task_id())
+    return data
+
+
+def _chain_failure_payload(
+    chain_id: str,
+    exc: BaseException,
+    hops_so_far: list[Any],
+) -> dict[str, Any]:
+    error = str(exc) or exc.__class__.__name__
+    return {
+        "chain_id": chain_id,
+        "status": "failed",
+        "error": error,
+        "error_type": exc.__class__.__name__,
+        "hops": hops_so_far,
+    }
+
+
+async def _runtime_chain_advance(
+    payload: dict[str, Any],
+    *,
+    settings: Any,
+    idem_cache: Any,
+    job_queue: Any,
+    execute_for_project: Callable[
+        [Handoff, str],
+        Awaitable[tuple[Any, Handoff | None]],
+    ],
+) -> None:
+    chain_id = payload["chain_id"]
+    pid = payload.get("project_id") or settings.project_name
+    max_hops = int(payload.get("max_hops", 6))
+    do_chain = bool(payload.get("chain", True))
+    step = int(payload.get("step", 0))
+    hops_so_far = list(payload.get("hops", []))
+
+    # Cooperative cancel: DELETE /chains/{id} stamps the idem slot
+    # with status='cancelled'. Honour it before doing any work so a
+    # cancel between two queued hops actually stops the chain.
+    existing = idem_cache.get("chain", chain_id, project_id=pid)
+    if isinstance(existing, dict) and existing.get("status") in {
+        "cancelled",
+        "failed",
+        "done",
+    }:
+        return
+
+    handoff = Handoff(**payload["handoff"])
+    try:
+        outcome, nxt = await execute_for_project(handoff, pid)
+    except (HandoffRejected, SLAExceeded) as exc:
+        # Fatal for this chain — record final state and stop.
+        idem_cache.put(
+            "chain",
+            chain_id,
+            _chain_failure_payload(chain_id, exc, hops_so_far),
+            project_id=pid,
+            ttl_seconds=86400.0,
+        )
+        return
+    except Exception as exc:
+        idem_cache.put(
+            "chain",
+            chain_id,
+            _chain_failure_payload(chain_id, exc, hops_so_far),
+            project_id=pid,
+            ttl_seconds=86400.0,
+        )
+        log.warning(
+            "runtime.chain.failed",
+            chain_id=chain_id,
+            project_id=pid,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return
+
+    hops_so_far.append({
+        "agent": outcome.agent,
+        "status": outcome.status,
+        "output": outcome.output,
+        "delegate_to": outcome.delegate_to,
+    })
+
+    more = do_chain and nxt is not None and (step + 1) < max_hops
+    if more and nxt is not None:
+        job_queue.enqueue(
+            "runtime.chain.advance",
+            {
+                "chain_id": chain_id,
+                "project_id": pid,
+                "max_hops": max_hops,
+                "chain": do_chain,
+                "step": step + 1,
+                "hops": hops_so_far,
+                "handoff": nxt.model_dump(mode="json"),
+            },
+            project_id=pid,
+            idempotency_key=f"{chain_id}:{step + 1}",
+            created_by="runtime.chain",
+        )
+        return
+
+    # Terminal: stash the final result under the chain id.
+    idem_cache.put(
+        "chain",
+        chain_id,
+        {"chain_id": chain_id, "status": "done", "hops": hops_so_far},
+        project_id=pid,
+        ttl_seconds=86400.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,76 +256,16 @@ def build_app() -> FastAPI:
     # restarts. At-least-once LLM calls, at-most-once hop OUTPUT (we
     # only re-enqueue after the hop's output is committed).
     # ----------------------------------------------------------------
-    async def _runtime_chain_advance(payload: dict[str, Any]) -> None:
-        chain_id = payload["chain_id"]
-        pid = payload.get("project_id") or settings.project_name
-        max_hops = int(payload.get("max_hops", 6))
-        do_chain = bool(payload.get("chain", True))
-        step = int(payload.get("step", 0))
-        hops_so_far = list(payload.get("hops", []))
-
-        # Cooperative cancel: DELETE /chains/{id} stamps the idem slot
-        # with status='cancelled'. Honour it before doing any work so a
-        # cancel between two queued hops actually stops the chain.
-        existing = idem_cache.get("chain", chain_id, project_id=pid)
-        if isinstance(existing, dict) and existing.get("status") == "cancelled":
-            return
-
-        handoff = Handoff(**payload["handoff"])
-        try:
-            outcome, nxt = await execute_for_project(handoff, pid)
-        except (HandoffRejected, SLAExceeded) as exc:
-            # Fatal for this chain — record final state and stop.
-            idem_cache.put(
-                "chain",
-                chain_id,
-                {
-                    "chain_id": chain_id,
-                    "status": "failed",
-                    "error": str(exc),
-                    "hops": hops_so_far,
-                },
-                project_id=pid,
-                ttl_seconds=86400.0,
-            )
-            return
-
-        hops_so_far.append({
-            "agent": outcome.agent,
-            "status": outcome.status,
-            "output": outcome.output,
-            "delegate_to": outcome.delegate_to,
-        })
-
-        more = do_chain and nxt is not None and (step + 1) < max_hops
-        if more and nxt is not None:
-            job_queue.enqueue(
-                "runtime.chain.advance",
-                {
-                    "chain_id": chain_id,
-                    "project_id": pid,
-                    "max_hops": max_hops,
-                    "chain": do_chain,
-                    "step": step + 1,
-                    "hops": hops_so_far,
-                    "handoff": nxt.model_dump(mode="json"),
-                },
-                project_id=pid,
-                idempotency_key=f"{chain_id}:{step + 1}",
-                created_by="runtime.chain",
-            )
-            return
-
-        # Terminal: stash the final result under the chain id.
-        idem_cache.put(
-            "chain",
-            chain_id,
-            {"chain_id": chain_id, "status": "done", "hops": hops_so_far},
-            project_id=pid,
-            ttl_seconds=86400.0,
+    async def _handle_runtime_chain_advance(payload: dict[str, Any]) -> None:
+        await _runtime_chain_advance(
+            payload,
+            settings=settings,
+            idem_cache=idem_cache,
+            job_queue=job_queue,
+            execute_for_project=execute_for_project,
         )
 
-    job_handlers["runtime.chain.advance"] = _runtime_chain_advance
+    job_handlers["runtime.chain.advance"] = _handle_runtime_chain_advance
 
     async def require_api_token(authorization: str | None = Header(default=None)) -> None:
         if not settings.api_token:
@@ -529,7 +588,7 @@ def build_app() -> FastAPI:
         handoff = Handoff(
             from_agent="user",
             to_agent="ops",
-            payload={"signal": sig.model_dump()},
+            payload={"signal": _signal_payload(sig)},
         )
         try:
             outcome, _ = await execute_for_project(handoff, pid)

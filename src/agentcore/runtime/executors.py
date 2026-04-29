@@ -68,11 +68,13 @@ async def run_inline(spec: ExecutorSpec, payload: dict[str, Any]) -> dict[str, A
     the executor's declared name.
     """
     diffs = payload.get("diffs") or []
+    file_ops = payload.get("file_ops") or []
     repo_root = payload.get("repo_root")
     try:
         result = await run_in_worktree(
             spec.command,
             diffs=diffs,
+            file_ops=file_ops,
             repo_root=repo_root,
             timeout_seconds=spec.timeout_seconds,
             artifact=spec.artifact,

@@ -26,7 +26,11 @@ soul:
 contract:
   inputs:
     - { name: plan_summary, type: string, required: true }
-    - { name: diffs,        type: list,   required: true }
+    # Either `file_ops` (preferred, structured) OR `diffs` (legacy
+    # unified diffs) is required. Runtime accepts either; QA reasons
+    # over whichever is present.
+    - { name: file_ops,     type: list,   required: false }
+    - { name: diffs,        type: list,   required: false }
     - { name: notes,        type: string, required: false }
     # Raw result of the test command discovered + run by the runtime
     # (see `discovers_commands: true` below). Shape:
