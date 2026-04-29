@@ -334,13 +334,18 @@ class JobQueue:
                 conn.cursor() as cur,
             ):
                 cur.execute(
-                    "SELECT attempts, max_attempts FROM agentcore_jobs WHERE id = %s",
+                    """
+                    SELECT project_id, kind, attempts, max_attempts, created_by
+                      FROM agentcore_jobs
+                     WHERE id = %s
+                    """,
                     (job_id,),
                 )
                 row = cur.fetchone()
                 if not row:
                     return
-                attempts, max_attempts = int(row[0]), int(row[1])
+                project_id, kind, attempts_raw, max_attempts_raw, created_by = row
+                attempts, max_attempts = int(attempts_raw), int(max_attempts_raw)
                 if attempts >= max_attempts:
                     # Final failure → dead-letter. Distinct from `failed`
                     # (transient) so cleanup() can preserve them for
@@ -356,6 +361,17 @@ class JobQueue:
                         """,
                         (error[:2000], job_id),
                     )
+                    if (cur.rowcount or 0) > 0:
+                        log.error(
+                            "jobs.dead_letter",
+                            job_id=job_id,
+                            project_id=str(project_id),
+                            kind=str(kind),
+                            attempts=attempts,
+                            max_attempts=max_attempts,
+                            created_by=created_by,
+                            error=error[:2000],
+                        )
                 else:
                     cur.execute(
                         """

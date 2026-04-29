@@ -25,34 +25,70 @@
 </section>
 {% endif %}
 
-<section class="card">
-  {% if agents %}
-  <table>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Provider / model</th>
-        <th>Accepts</th>
-        <th>Delegates</th>
-        <th>SLA</th>
-        <th>Source</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for a in agents %}
-      <tr>
-        <td><strong>{{ a.name }}</strong><div class="muted small">{{ a.description }}</div></td>
-        <td><code>{{ a.provider }}</code> / <code>{{ a.model }}</code></td>
-        <td class="small">{{ a.accepts_from|join(', ') or '—' }}</td>
-        <td class="small">{{ a.delegates_to|join(', ') or '—' }}</td>
-        <td class="mono small">{{ a.sla_seconds or '—' }}s</td>
-        <td><code class="truncate">{{ a.source_path }}</code></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <div class="empty">No agents loaded. Drop <code>*.agent.md</code> files into <code>{{ agents_dir }}</code>.</div>
-  {% endif %}
+{% if agents %}
+{% for a in agents %}
+<section class="card" style="margin-bottom: 12px">
+  <details {% if loop.first %}open{% endif %}>
+    <summary style="cursor: pointer; list-style: none">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 16px">
+        <div>
+          <strong style="font-size: 1.1em">{{ a.name }}</strong>
+          <span class="muted small" style="margin-left: 8px">{{ a.description }}</span>
+        </div>
+        <div class="row" style="gap: 8px">
+          <span class="badge">{{ a.tasks_count }} task(s)</span>
+          {% if a.delegations_made %}<span class="badge">→ {{ a.delegations_made }}</span>{% endif %}
+          {% if a.delegations_received %}<span class="badge">← {{ a.delegations_received }}</span>{% endif %}
+          <span class="muted small">▾</span>
+        </div>
+      </div>
+    </summary>
+
+    <div style="padding-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px">
+      <div>
+        <div class="muted small" style="text-transform: uppercase; letter-spacing: 0.04em">Spec</div>
+        <table style="width: 100%; margin-top: 8px">
+          <tbody>
+            <tr><td class="muted small">provider/model</td>
+                <td><code>{{ a.provider }}</code> / <code>{{ a.model }}</code></td></tr>
+            <tr><td class="muted small">accepts from</td>
+                <td class="small">{{ a.accepts_from|join(', ') or '—' }}</td></tr>
+            <tr><td class="muted small">delegates to</td>
+                <td class="small">{{ a.delegates_to|join(', ') or '—' }}</td></tr>
+            <tr><td class="muted small">sla</td>
+                <td class="mono small">{{ a.sla_seconds or '—' }}s</td></tr>
+            <tr><td class="muted small">source</td>
+                <td><code class="truncate">{{ a.source_path }}</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <div class="muted small" style="text-transform: uppercase; letter-spacing: 0.04em">Recent tasks</div>
+        {% if a.recent_tasks %}
+        <table style="width: 100%; margin-top: 8px">
+          <tbody>
+            {% for t in a.recent_tasks %}
+            <tr>
+              <td><code>{{ t.chain_id[:12] }}…</code></td>
+              <td class="muted small nowrap">{{ t.updated_at }}</td>
+              <td>
+                <a class="small" href="{{ url_for('ui-chain-detail', chain_id=t.chain_id) }}{% if request.query_params.get('project') %}?project={{ request.query_params.get('project') }}{% endif %}">open →</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="muted small" style="margin-top: 8px">No tasks recorded for this agent yet.</div>
+        {% endif %}
+      </div>
+    </div>
+  </details>
 </section>
+{% endfor %}
+{% else %}
+<section class="card">
+  <div class="empty">No agents loaded. Drop <code>*.agent.md</code> files into <code>{{ agents_dir }}</code>.</div>
+</section>
+{% endif %}
 {% endblock %}

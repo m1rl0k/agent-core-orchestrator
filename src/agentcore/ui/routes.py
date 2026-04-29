@@ -120,7 +120,14 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 host={"os": host_info.os, "arch": host_info.arch, "shell": host_info.shell},
                 stats=stats,
                 capabilities={
-                    k: {f: getattr(v, f) for f in v.__slots__}
+                    # `__slots__` covers the dataclass fields; `status`
+                    # is a derived @property and must be added by hand,
+                    # otherwise the template's `cap.status` renders
+                    # empty.
+                    k: {
+                        **{f: getattr(v, f) for f in v.__slots__},
+                        "status": v.status,
+                    }
                     for k, v in capabilities.items()
                 },
                 recent_chains=recent,
@@ -129,6 +136,11 @@ def mount_ui(  # type: ignore[no-untyped-def]
 
     @app.get("/ui/agents", response_class=HTMLResponse, name="ui-agents")
     async def ui_agents(request: Request) -> HTMLResponse:
+        pid = _pid(request)
+        # Per-agent activity from the operational graph: how many tasks
+        # they've worked on, recent task ids + ages. Lets the operator
+        # expand a row and see what an agent has actually been doing.
+        activity = _agent_activity(settings, pid)
         agents = [
             {
                 "name": s.name,
@@ -139,6 +151,10 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 "delegates_to": s.contract.delegates_to,
                 "sla_seconds": s.contract.sla_seconds,
                 "source_path": s.source_path or "",
+                "tasks_count": activity.get(s.name, {}).get("tasks_count", 0),
+                "recent_tasks": activity.get(s.name, {}).get("recent_tasks", []),
+                "delegations_made": activity.get(s.name, {}).get("delegations_made", 0),
+                "delegations_received": activity.get(s.name, {}).get("delegations_received", 0),
             }
             for s in registry.all()
         ]
@@ -396,6 +412,95 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
         cur.execute(sql, (project_id, project_id))
         row = cur.fetchone()
     return int(row[0] or 0) if row else 0
+
+
+def _agent_activity(  # type: ignore[no-untyped-def]
+    settings, project_id: str
+) -> dict[str, dict[str, Any]]:
+    """Per-agent activity rollup from the graph: how many tasks each
+    agent worked on, recent tasks with ages, and how many handoffs each
+    side of the agent->agent edge participated in.
+
+    Returns `{agent_name: {tasks_count, recent_tasks, delegations_made,
+    delegations_received}}`. Empty dict on DB miss (UI degrades to
+    static info).
+    """
+    import psycopg
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with (
+            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            conn.cursor() as cur,
+        ):
+            # Total tasks each agent worked on (one edge per agent per
+            # task; counts dedupe via DISTINCT).
+            cur.execute(
+                """
+                SELECT replace(source, 'agent:', '') AS agent,
+                       count(DISTINCT target) AS n
+                  FROM agentcore_graph_edges
+                 WHERE project_id = %s
+                   AND relation = 'worked_on'
+                   AND source LIKE 'agent:%%'
+              GROUP BY source
+                """,
+                (project_id,),
+            )
+            for agent, n in cur.fetchall() or []:
+                out.setdefault(str(agent), {})["tasks_count"] = int(n)
+
+            # Recent tasks per agent — last 5 by task last_seen.
+            cur.execute(
+                """
+                SELECT
+                    replace(e.source, 'agent:', '') AS agent,
+                    replace(n.id, 'task:', '')      AS chain_id,
+                    n.last_seen
+                  FROM agentcore_graph_edges e
+                  JOIN agentcore_graph_nodes n
+                    ON n.id = e.target AND n.project_id = e.project_id
+                 WHERE e.project_id = %s
+                   AND e.relation = 'worked_on'
+                   AND e.source LIKE 'agent:%%'
+                   AND n.kind = 'task'
+              ORDER BY n.last_seen DESC
+                """,
+                (project_id,),
+            )
+            for agent, chain_id, last_seen in cur.fetchall() or []:
+                bucket = out.setdefault(str(agent), {}).setdefault("recent_tasks", [])
+                if len(bucket) >= 5:
+                    continue
+                bucket.append({
+                    "chain_id": str(chain_id),
+                    "updated_at": _age(last_seen),
+                })
+
+            # Handoff edges (delegations) — once each direction.
+            cur.execute(
+                """
+                SELECT replace(source, 'agent:', '') AS src,
+                       replace(target, 'agent:', '') AS tgt,
+                       count(*) AS n
+                  FROM agentcore_graph_edges
+                 WHERE project_id = %s AND relation = 'handoff'
+              GROUP BY source, target
+                """,
+                (project_id,),
+            )
+            for src, tgt, n in cur.fetchall() or []:
+                out.setdefault(str(src), {})
+                out.setdefault(str(tgt), {})
+                out[str(src)]["delegations_made"] = (
+                    out[str(src)].get("delegations_made", 0) + int(n)
+                )
+                out[str(tgt)]["delegations_received"] = (
+                    out[str(tgt)].get("delegations_received", 0) + int(n)
+                )
+    except Exception as exc:
+        log.warning("ui.agent_activity_failed", error=str(exc))
+    return out
 
 
 def _graph_sizes(settings, project_id: str) -> tuple[int, int]:  # type: ignore[no-untyped-def]
@@ -661,31 +766,56 @@ def _recent_chains(  # type: ignore[no-untyped-def]
             }
 
         # Source 2: CLI / direct chains via graph task nodes.
+        # We pull two metrics in the same query: how many distinct
+        # agents handed off on this chain (= hop count) and the labels
+        # (for status inference).
         cur.execute(
             """
-            SELECT replace(id, 'task:', '') AS chain_id, labels, last_seen
-              FROM agentcore_graph_nodes
-             WHERE project_id = %s AND kind = 'task'
-          ORDER BY last_seen DESC
+            SELECT
+                replace(n.id, 'task:', '') AS chain_id,
+                n.labels,
+                n.last_seen,
+                COALESCE(h.hop_count, 0) AS hop_count
+              FROM agentcore_graph_nodes n
+              LEFT JOIN (
+                SELECT target, count(*) AS hop_count
+                  FROM agentcore_graph_edges
+                 WHERE project_id = %s AND relation = 'worked_on'
+                 GROUP BY target
+              ) AS h ON h.target = n.id
+             WHERE n.project_id = %s AND n.kind = 'task'
+          ORDER BY n.last_seen DESC
              LIMIT %s
             """,
-            (pid, int(limit)),
+            (pid, pid, int(limit)),
         )
-        for chain_id, labels, last_seen in cur.fetchall() or []:
+        for chain_id, labels, last_seen, hop_count in cur.fetchall() or []:
             cid = str(chain_id)
             if cid in out:
                 continue  # idempotency entry wins (richer)
             lbls = labels if isinstance(labels, dict) else {}
+            # Infer status from any of the prf labels we know about.
             if "qa_passed" in lbls or "positive" in lbls:
                 status = "done"
-            elif "qa_failed" in lbls:
+            elif "qa_failed" in lbls or "negative" in lbls:
                 status = "failed"
+            elif "dev_revised" in lbls or "architect_revised" in lbls:
+                # Mid-flight revision was tagged but no terminal label
+                # — chain ran but didn't reach a clean approval.
+                status = "in_review"
+            elif int(hop_count) > 0:
+                # No PRF label at all but at least one agent worked on
+                # it — the chain ran (just didn't tag terminal).
+                status = "ran"
             else:
                 status = "unknown"
             out[cid] = {
                 "chain_id": cid,
                 "status": status,
-                "hops": [],
+                # Hops as a list-of-dicts so the template's `c.hops|length`
+                # reads the same as for HTTP-source rows. Content is a
+                # placeholder (we know the count, not the per-hop detail).
+                "hops": [{"agent": "?"}] * int(hop_count),
                 "updated_at": _age(last_seen),
                 "_ts": last_seen,
                 "source": "cli",
