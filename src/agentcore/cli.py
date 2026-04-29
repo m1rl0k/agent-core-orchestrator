@@ -1132,11 +1132,34 @@ def _tail_local(path: Path, *, interval: float) -> None:
                         continue
                     _render_trace_event(evt)
                     last_kind = evt.get("kind", "")
+                    # `result` is the canonical terminal CLI event.
+                    if last_kind == "result":
+                        d = evt.get("detail") or {}
+                        approved = d.get("approved")
+                        applied_count = d.get("applied_count", 0)
+                        if approved is True and applied_count:
+                            tone, headline = (
+                                "green",
+                                f"approved · applied {applied_count} file(s)",
+                            )
+                        elif approved is True:
+                            tone, headline = "yellow", "approved · no diffs"
+                        elif approved is False:
+                            tone, headline = (
+                                "yellow",
+                                "blocked by review",
+                            )
+                        else:
+                            tone, headline = "cyan", "finished"
+                        console.rule(
+                            f"[bold {tone}]chain {headline}[/bold {tone}]"
+                        )
+                        return
             else:
                 idle_ticks += 1
-                # If 10 polls go by with no new lines and the last
-                # event was an outcome / error, treat it as terminal.
-                if idle_ticks >= 10 and last_kind in ("outcome", "error"):
+                # Fallback: 10 quiet polls + last event was outcome/error
+                # → assume terminal even if no `result` was recorded.
+                if idle_ticks >= 10 and last_kind in ("outcome", "error", "applied"):
                     console.rule("[bold green]trace idle (chain finished)[/bold green]")
                     return
             time.sleep(interval)
