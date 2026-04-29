@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import typer
 import uvicorn
@@ -448,26 +449,81 @@ async def _run_chain(
     *,
     start_at: str = "architect",
 ) -> tuple[dict, str]:
-    """Drive the role mesh from `start_at`. Captures each role's output by name."""
+    """Drive the role mesh from `start_at`. Captures each role's output by name.
+
+    Pretty output: rich Live status while each agent is thinking, Panel +
+    syntax-highlighted JSON for each completed hop, and inline Syntax for any
+    unified diffs in the developer's payload.
+    """
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.status import Status
+    from rich.syntax import Syntax
+
     handoff = Handoff(
         task_id=new_task_id(),
         from_agent="user",
         to_agent=start_at,
         payload={"brief": brief},
     )
-    console.print(f"[bold]task {handoff.task_id}[/bold]  starting at {start_at}")
+    console.print(
+        Panel(
+            f"[bold cyan]task[/bold cyan] {handoff.task_id}\n"
+            f"[bold cyan]brief[/bold cyan]\n{brief}",
+            title=f"agentcore · starting at [bold]{start_at}[/bold]",
+            border_style="cyan",
+        )
+    )
     state: dict = {}
     current: Handoff | None = handoff
     for _ in range(max_hops):
         if current is None:
             break
-        outcome, nxt = await runtime.execute(current)
-        state[f"{outcome.agent}_output"] = outcome.output
-        console.rule(f"[bold]{outcome.agent}[/bold] · {outcome.status}")
+        # Progress spinner while the LLM is thinking.
+        status = Status(
+            f"[bold yellow]{current.to_agent}[/bold yellow] thinking…  "
+            f"(step {current.step})",
+            console=console,
+            spinner="dots",
+        )
+        status.start()
         try:
-            console.print_json(json.dumps(outcome.output))
+            outcome, nxt = await runtime.execute(current)
+        finally:
+            status.stop()
+        state[f"{outcome.agent}_output"] = outcome.output
+
+        body_renderable: Any
+        try:
+            body_renderable = Syntax(
+                json.dumps(outcome.output, indent=2),
+                "json",
+                theme="ansi_dark",
+                line_numbers=False,
+                word_wrap=True,
+            )
         except (TypeError, ValueError):
-            console.print(str(outcome.output)[:1000])
+            body_renderable = Markdown(str(outcome.output)[:4000])
+
+        console.print(
+            Panel(
+                body_renderable,
+                title=f"[bold]{outcome.agent}[/bold] · {outcome.status}",
+                border_style="green" if outcome.status == "ok" or outcome.status == "delegated" else "yellow",
+                padding=(0, 1),
+            )
+        )
+        # Bonus: surface unified diffs with proper syntax highlighting.
+        for d in outcome.output.get("diffs", []) or []:
+            if isinstance(d, dict) and d.get("unified_diff"):
+                console.print(
+                    Panel(
+                        Syntax(d["unified_diff"], "diff", theme="ansi_dark"),
+                        title=f"diff · {d.get('path', '?')}",
+                        border_style="blue",
+                        padding=(0, 1),
+                    )
+                )
         if not (chain and nxt):
             break
         current = nxt
