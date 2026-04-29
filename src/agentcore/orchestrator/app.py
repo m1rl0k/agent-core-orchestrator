@@ -47,6 +47,12 @@ class RunRequest(BaseModel):
     from_agent: str = "user"
     chain: bool = True
     max_hops: int = 6
+    # When true, the chain runs as durable jobs — each hop is its own
+    # row in agentcore_jobs, so an orchestrator restart in the middle
+    # of a hop is reclaimed by another worker (or the same one on
+    # boot) when the lock expires. Trade-off: every hop pays one extra
+    # round-trip to Postgres; result is fetched via GET /chains/{id}.
+    durable: bool = False
 
 
 class HandoffRequest(BaseModel):
@@ -114,6 +120,80 @@ def build_app() -> FastAPI:
         registry=registry, router=router, traces=traces,
         graph=graph, graphify=graphify, retriever=retriever,
     )
+
+    # ----------------------------------------------------------------
+    # Durable chain handler — registered regardless of wiki state.
+    # `durable: true` on /run enqueues runtime.chain.advance jobs; the
+    # handler runs one hop and either finalises the chain (storing the
+    # result in the idempotency cache under scope='chain') or
+    # re-enqueues the successor. Worker death mid-hop is reclaimed via
+    # the existing lock_until path, so chains survive orchestrator
+    # restarts. At-least-once LLM calls, at-most-once hop OUTPUT (we
+    # only re-enqueue after the hop's output is committed).
+    # ----------------------------------------------------------------
+    async def _runtime_chain_advance(payload: dict[str, Any]) -> None:
+        chain_id = payload["chain_id"]
+        pid = payload.get("project_id") or settings.project_name
+        max_hops = int(payload.get("max_hops", 6))
+        do_chain = bool(payload.get("chain", True))
+        step = int(payload.get("step", 0))
+        hops_so_far = list(payload.get("hops", []))
+
+        handoff = Handoff(**payload["handoff"])
+        try:
+            outcome, nxt = await runtime.execute(handoff)
+        except (HandoffRejected, SLAExceeded) as exc:
+            # Fatal for this chain — record final state and stop.
+            idem_cache.put(
+                "chain",
+                chain_id,
+                {
+                    "chain_id": chain_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "hops": hops_so_far,
+                },
+                project_id=pid,
+                ttl_seconds=86400.0,
+            )
+            return
+
+        hops_so_far.append({
+            "agent": outcome.agent,
+            "status": outcome.status,
+            "output": outcome.output,
+            "delegate_to": outcome.delegate_to,
+        })
+
+        more = do_chain and nxt is not None and (step + 1) < max_hops
+        if more and nxt is not None:
+            job_queue.enqueue(
+                "runtime.chain.advance",
+                {
+                    "chain_id": chain_id,
+                    "project_id": pid,
+                    "max_hops": max_hops,
+                    "chain": do_chain,
+                    "step": step + 1,
+                    "hops": hops_so_far,
+                    "handoff": nxt.model_dump(mode="json"),
+                },
+                project_id=pid,
+                idempotency_key=f"{chain_id}:{step + 1}",
+                created_by="runtime.chain",
+            )
+            return
+
+        # Terminal: stash the final result under the chain id.
+        idem_cache.put(
+            "chain",
+            chain_id,
+            {"chain_id": chain_id, "status": "done", "hops": hops_so_far},
+            project_id=pid,
+            ttl_seconds=86400.0,
+        )
+
+    job_handlers["runtime.chain.advance"] = _runtime_chain_advance
 
     async def require_api_token(authorization: str | None = Header(default=None)) -> None:
         if not settings.api_token:
@@ -212,23 +292,54 @@ def build_app() -> FastAPI:
             current = nxt
         return hops
 
-    @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_api_token)])
+    @app.post("/run", dependencies=[Depends(require_api_token)])
     async def run(
         req: RunRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         project_id: str | None = Header(default=None, alias="X-Project-Id"),
-    ) -> RunResponse:
+    ) -> dict[str, Any]:
         pid = project_id or settings.project_name
         if idempotency_key:
             cached = idem_cache.get("run", idempotency_key, project_id=pid)
             if cached is not None:
-                return RunResponse(**cached)
+                return cached
         handoff = Handoff(
             task_id=new_task_id(),
             from_agent=req.from_agent,
             to_agent=req.to_agent,
             payload=req.payload,
         )
+
+        # Durable mode: enqueue first hop and return 202. Result fetched
+        # later via GET /chains/{chain_id}. Survives restarts because each
+        # hop is its own jobs row with lock_until reclaim semantics.
+        if req.durable:
+            chain_id = handoff.task_id
+            jid = job_queue.enqueue(
+                "runtime.chain.advance",
+                {
+                    "chain_id": chain_id,
+                    "project_id": pid,
+                    "max_hops": req.max_hops,
+                    "chain": req.chain,
+                    "step": 0,
+                    "hops": [],
+                    "handoff": handoff.model_dump(mode="json"),
+                },
+                project_id=pid,
+                idempotency_key=f"{chain_id}:0",
+                created_by="run/durable",
+            )
+            resp_d = {
+                "task_id": chain_id,
+                "chain_id": chain_id,
+                "status": "queued",
+                "job_id": jid,
+                "project_id": pid,
+            }
+            if idempotency_key:
+                idem_cache.put("run", idempotency_key, resp_d, project_id=pid)
+            return resp_d
         chain_cap = settings.max_chain_seconds
         try:
             if chain_cap and chain_cap > 0:
@@ -248,10 +359,10 @@ def build_app() -> FastAPI:
                 detail=f"chain exceeded max_chain_seconds={chain_cap}",
             ) from exc
         save_graph_best_effort()
-        resp = RunResponse(task_id=handoff.task_id, hops=hops)
+        resp_dict = RunResponse(task_id=handoff.task_id, hops=hops).model_dump()
         if idempotency_key:
-            idem_cache.put("run", idempotency_key, resp.model_dump(), project_id=pid)
-        return resp
+            idem_cache.put("run", idempotency_key, resp_dict, project_id=pid)
+        return resp_dict
 
     @app.post("/handoff", response_model=RunResponse, dependencies=[Depends(require_api_token)])
     async def handoff_one(
@@ -316,6 +427,27 @@ def build_app() -> FastAPI:
         if idempotency_key:
             idem_cache.put("signal", idempotency_key, resp, project_id=pid)
         return resp
+
+    @app.get("/chains/{chain_id}")
+    async def chain_status(
+        chain_id: str,
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    ) -> dict[str, Any]:
+        """Status of a durable chain.
+
+        Returned shapes:
+          - terminal: {chain_id, status: "done"|"failed", hops: [...]}
+          - in-flight: {chain_id, status: "running"}
+          - unknown: 404
+        """
+        pid = project_id or settings.project_name
+        cached = idem_cache.get("chain", chain_id, project_id=pid)
+        if cached is not None:
+            return cached
+        # Not in the result cache yet — chain is either still running or
+        # the cache TTL expired. We return 'running' so polling clients
+        # don't 404 spuriously between hops.
+        return {"chain_id": chain_id, "status": "running"}
 
     @app.get("/tasks/{task_id}/trace")
     async def trace(task_id: str) -> dict[str, Any]:
