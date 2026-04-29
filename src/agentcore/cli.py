@@ -583,6 +583,7 @@ async def _plan_async_body(
         ))
 
     # Chain-end PRF tagging.
+    converged = False
     if state.get("qa_output") is not None:
         out = state["qa_output"]
         if out.get("failed"):
@@ -593,8 +594,47 @@ async def _plan_async_body(
         else:
             graph.tag_relevance(task_id, prf.QA_PASSED)
             graph.tag_task(task_id, prf.POSITIVE)
+            converged = True
 
     graph.save()
+
+    # Living-wiki maintenance — runs inline against the chain's repo so
+    # the wiki actually exists for projects that have never been seeded.
+    # Cold start: walk the repo to seed module pages. Warm: revise pages
+    # whose `sources[]` overlap the touched paths. Best-effort and
+    # idempotent (storage skips unchanged pages); never blocks the
+    # chain or surfaces a wiki failure as a chain failure.
+    if converged and applied and settings.enable_wiki:
+        try:
+            storage, _index, curator = _build_wiki_stack(settings, repo_abs)
+            existing_pages = list(storage.walk())
+            if not existing_pages:
+                console.print("[dim]wiki: seeding pages (first run)…[/dim]")
+                written = await curator.seed_from_repo(repo_abs)
+                mode = "seed"
+            else:
+                console.print("[dim]wiki: refreshing affected pages…[/dim]")
+                written = await curator.incremental(applied, repo_abs)
+                mode = "incremental"
+            if written:
+                console.print(
+                    f"[dim]wiki: {mode} updated {len(written)} page(s)[/dim]"
+                )
+            traces.record(TraceEvent(
+                task_id=task_id, step=99, kind="wiki_refresh", actor="cli",
+                detail={
+                    "mode": mode,
+                    "changed_paths": applied[:20],
+                    "written": written[:20],
+                    "project_id": settings.project_name,
+                },
+            ))
+        except Exception as exc:
+            console.print(f"[yellow]wiki refresh skipped:[/yellow] {exc}")
+            traces.record(TraceEvent(
+                task_id=task_id, step=99, kind="wiki_refresh_failed",
+                actor="cli", detail={"error": str(exc)[:300]},
+            ))
 
     # Final result trace — gives `agentcore tail` a clean terminal
     # event so it stops following confidently regardless of in-process
