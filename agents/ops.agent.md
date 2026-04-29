@@ -5,8 +5,8 @@ tools: [Read, Bash, Grep, Glob]
 model: claude-sonnet-4-6
 
 llm:
-  provider: anthropic
-  model: claude-sonnet-4-6
+  provider: bedrock
+  model: moonshot.kimi-k2-thinking
   temperature: 0.1
   max_tokens: 4096
 
@@ -26,11 +26,11 @@ contract:
     - { name: failed,        type: list,   required: false }
     - { name: signal,        type: Signal, required: false, description: "Set when invoked from a webhook/scan" }
   outputs:
-    - { name: target_branch,   type: string,        required: true }
-    - { name: pipeline_status, type: string,        required: true }
-    - { name: commit_sha,      type: string,        required: false }
-    - { name: artifacts,       type: list[string],  required: false }
-    - { name: notes,           type: string,        required: false }
+    - { name: target_branch,   type: string,           required: true }
+    - { name: pipeline_status, type: string,           required: true }
+    - { name: commit_sha,      type: string,           required: false }
+    - { name: artifacts,       type: "list[string]",   required: false }
+    - { name: notes,           type: string,           required: false }
   accepts_handoff_from: [user, qa, architect]
   delegates_to: [architect]
   sla_seconds: 300

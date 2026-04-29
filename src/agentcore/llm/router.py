@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -132,24 +133,28 @@ class LLMRouter:
         model_config = self.resolve_config(model_config)
         provider = model_config.provider
         if provider == "anthropic":
-            return await _with_retry(
+            resp = await _with_retry(
                 self.settings,
                 lambda: _call_anthropic(messages, model_config, self._anthropic_client()),
             )
-        if provider == "bedrock":
+        elif provider == "bedrock":
             # boto3 has its own retry policy; don't double up.
-            return await _call_bedrock(messages, model_config, self.settings)
-        if provider == "azure_openai":
-            return await _with_retry(
+            resp = await _call_bedrock(messages, model_config, self.settings)
+        elif provider == "azure_openai":
+            resp = await _with_retry(
                 self.settings,
                 lambda: _call_azure_openai(messages, model_config, self._azure_client()),
             )
-        if provider == "zai":
-            return await _with_retry(
+        elif provider == "zai":
+            resp = await _with_retry(
                 self.settings,
                 lambda: _call_zai(messages, model_config, self._zai_client()),
             )
-        raise ValueError(f"unknown LLM provider: {provider!r}")
+        else:
+            raise ValueError(f"unknown LLM provider: {provider!r}")
+
+        resp.text = _strip_thinking(resp.text)
+        return resp
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +204,19 @@ def _split_system(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]
     sys_parts = [m.content for m in messages if m.role == "system"]
     rest = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
     return "\n\n".join(sys_parts), rest
+
+
+# Reasoning models (Kimi-Thinking, DeepSeek-R1, others) emit chain-of-thought
+# inside `<think>...</think>` blocks before the final answer. The runtime's
+# JSON parser doesn't want that scratch text. Strip it once at the router
+# boundary so every downstream consumer sees only the final response.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    if not text or "<think>" not in text.lower():
+        return text
+    return _THINK_BLOCK.sub("", text).lstrip()
 
 
 # ---------------------------------------------------------------------------

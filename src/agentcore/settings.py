@@ -84,7 +84,12 @@ class Settings(BaseSettings):
         "claude-sonnet-4-6", alias="AGENTCORE_DEFAULT_MODEL_ANTHROPIC"
     )
     default_model_bedrock: str = Field(
-        "anthropic.claude-sonnet-4-6", alias="AGENTCORE_DEFAULT_MODEL_BEDROCK"
+        # Kimi K2 Thinking — frontier reasoning + coding model. Tops SWE-Bench
+        # Verified / LiveCodeBench v6 in the K2 family; chain-of-thought is
+        # stripped at the router boundary so JSON-only contracts stay clean.
+        # Per-agent overrides via `llm.model` in each agent.md still apply.
+        "moonshot.kimi-k2-thinking",
+        alias="AGENTCORE_DEFAULT_MODEL_BEDROCK",
     )
     default_model_azure_openai: str = Field(
         "gpt-4o", alias="AGENTCORE_DEFAULT_MODEL_AZURE_OPENAI"
