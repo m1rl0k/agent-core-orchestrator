@@ -399,20 +399,28 @@ async def _plan_async(
                 apply = False
                 break
             blockers = [b for v in verdicts if not v["approved"] for b in v.get("blockers", [])]
+            # Continuous improvement loop: any role can take the re-review.
+            # The reviewer's `route_back_to` picks the role best able to
+            # address the blockers (architect for plan-level, developer
+            # for patch-level, qa for test gaps, ops for ship-readiness).
+            # We synthesize the right input payload from existing state
+            # so the target's contract is satisfied.
             target = next(
-                (v.get("route_back_to", "developer") for v in verdicts if not v["approved"]),
-                "developer",
+                (v.get("route_back_to", "architect") for v in verdicts if not v["approved"]),
+                "architect",
             )
             console.print(
                 f"[yellow]routing back to {target}[/yellow] with "
                 f"{len(blockers)} blocker(s)"
             )
+            payload = _synthesize_handoff_payload(target, state, blockers, brief)
             state, task_id = await _run_chain(
                 runtime,
                 _compose_revision_brief(brief, blockers, state),
                 chain,
                 max_hops,
                 start_at=target,
+                payload=payload,
             )
             loop_idx += 1
 
@@ -457,6 +465,7 @@ async def _run_chain(
     max_hops: int,
     *,
     start_at: str = "architect",
+    payload: dict | None = None,
 ) -> tuple[dict, str]:
     """Drive the role mesh from `start_at`. Captures each role's output by name.
 
@@ -468,6 +477,10 @@ async def _run_chain(
     target's contract: most roles only accept handoffs from specific
     upstream roles, so a route-back to e.g. 'developer' must come from
     'architect', not 'user' (else the runtime rejects it).
+
+    `payload` overrides the default `{"brief": brief}` — used by the
+    review loop to feed the right upstream output (TechnicalPlan,
+    ImplementationPatch, etc.) when re-entering mid-chain.
     """
     spec = runtime.registry.get(start_at)
     accepts = list(getattr(spec.contract, "accepts_handoff_from", [])) if spec else []
@@ -476,7 +489,7 @@ async def _run_chain(
         task_id=new_task_id(),
         from_agent=from_agent,
         to_agent=start_at,
-        payload={"brief": brief},
+        payload=payload if payload is not None else {"brief": brief},
     )
     console.print(
         Panel(
@@ -641,6 +654,49 @@ def _compose_revision_brief(
         f"{bullets}\n\n"
         "Keep the change minimal; do not introduce unrelated edits."
     )
+
+
+def _synthesize_handoff_payload(
+    target: str, state: dict, blockers: list[str], brief: str
+) -> dict:
+    """Build a contract-shaped payload for re-entering the chain at `target`.
+
+    Each role expects a specific input shape (architect → brief, developer →
+    TechnicalPlan, qa → ImplementationPatch, ops → QAReport). When a review
+    routes back mid-chain, we synthesize that shape from the captured state
+    and prepend the blockers as a revision instruction in the role's primary
+    text field — so the target sees both the upstream artifact AND what
+    needs fixing.
+    """
+    revision_brief = _compose_revision_brief(brief, blockers, state)
+    if target == "architect":
+        return {"brief": revision_brief}
+    if target == "developer":
+        plan = state.get("architect_output") or {}
+        return {
+            "summary": revision_brief + "\n\nORIGINAL PLAN: "
+            + str(plan.get("summary", "")),
+            "files_to_change": plan.get("files_to_change", []),
+            "risks": plan.get("risks", []),
+            "test_strategy": plan.get("test_strategy", ""),
+        }
+    if target == "qa":
+        patch = state.get("developer_output") or {}
+        return {
+            "plan_summary": revision_brief + "\n\nPRIOR PATCH: "
+            + str(patch.get("plan_summary", "")),
+            "diffs": patch.get("diffs", []),
+            "notes": patch.get("notes", ""),
+        }
+    if target == "ops":
+        qa = state.get("qa_output") or {}
+        return {
+            "suite_summary": revision_brief + "\n\nQA REPORT: "
+            + str(qa.get("suite_summary", "")),
+            "passed": qa.get("passed", []),
+            "failed": qa.get("failed", []),
+        }
+    return {"brief": revision_brief}
 
 
 def _apply_diffs(repo: Path, diffs: list[dict]) -> list[str]:

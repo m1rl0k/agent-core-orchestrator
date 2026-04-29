@@ -32,8 +32,18 @@ from agentcore.llm.router import ChatMessage, LLMRouter
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.retrieval.hybrid import HybridRetriever
+from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry
 from agentcore.spec.models import AgentSpec, Contract
+
+# Approx chars-per-token for English+JSON. Used to convert the
+# `llm_context_budget_tokens` setting into a chars budget cheaply
+# (without a real tokenizer).
+_CHARS_PER_TOKEN = 3.0
+# Headroom we reserve for system prompt + schema hint + retrieval block.
+# Conservative: well-equipped agents can carry a 4-10k system prompt and
+# we still want a healthy reply window inside the 200k budget.
+_NON_PAYLOAD_CHARS = 20_000
 
 log = structlog.get_logger(__name__)
 
@@ -101,37 +111,37 @@ class Runtime:
                          {"contract": exc.errors})
             raise
 
-        # 3. LLM call (with optional SLA enforcement)
-        messages = await self._render_messages(spec, handoff)
-        self._record(handoff.task_id, handoff.step, "llm_call", spec.name,
-                     {"provider": spec.llm.provider, "model": spec.llm.model,
-                      "sla_seconds": spec.contract.sla_seconds})
-        try:
-            if spec.contract.sla_seconds:
-                import asyncio as _aio
-
-                resp = await _aio.wait_for(
-                    self.router.complete(messages, spec.llm),
-                    timeout=float(spec.contract.sla_seconds),
-                )
-            else:
-                resp = await self.router.complete(messages, spec.llm)
-        except TimeoutError as exc:
+        # 3. LLM call(s). When the rendered context would blow the budget
+        #    we split the largest list-typed input field into chunks, run
+        #    the LLM per chunk, and merge the structured outputs. One
+        #    chunk = the original behaviour. Every agent gets batching for
+        #    free; nothing in the agent.md needs to opt in.
+        chunks = self._split_payload(spec, handoff)
+        if len(chunks) == 1:
+            output = await self._one_shot(spec, handoff)
+        else:
             self._record(
-                handoff.task_id, handoff.step, "error", spec.name,
-                {"timeout": spec.contract.sla_seconds, "phase": "llm_call"},
+                handoff.task_id, handoff.step, "batch_split", spec.name,
+                {"chunks": len(chunks)},
             )
-            raise SLAExceeded(spec.name, spec.contract.sla_seconds) from exc
+            partials: list[dict[str, Any]] = []
+            for i, chunk_payload in enumerate(chunks):
+                sub = handoff.model_copy(update={"payload": chunk_payload})
+                self._record(
+                    handoff.task_id, handoff.step, "batch_chunk", spec.name,
+                    {"chunk": i + 1, "of": len(chunks)},
+                )
+                partials.append(await self._one_shot(spec, sub))
+            output = self._merge_outputs(spec, partials)
 
-        # 4. Parse + validate output
-        output = self._parse_json_block(resp.text)
+        # 4. Validate the (merged) output once.
         try:
             validate_payload(
                 spec.contract.outputs, output, agent=spec.name, direction="output"
             )
         except ContractViolation as exc:
             self._record(handoff.task_id, handoff.step, "error", spec.name,
-                         {"contract": exc.errors, "raw": resp.text[:1000]})
+                         {"contract": exc.errors, "raw": str(output)[:1000]})
             raise
 
         # 5. Outcome
@@ -159,6 +169,138 @@ class Runtime:
                 notes=f"emitted by {spec.name}",
             )
         return outcome, next_handoff
+
+    # ------------------------------------------------------------------
+    # LLM call + batching
+    # ------------------------------------------------------------------
+
+    async def _one_shot(self, spec: AgentSpec, handoff: Handoff) -> dict[str, Any]:
+        """Render messages, call the LLM honouring SLA, parse JSON.
+
+        Used once for normal hops and once per chunk for batched hops.
+        Retries once on parse failure with a tightened reminder appended —
+        thinking models occasionally emit `<think>...</think>` followed by
+        a bare code fence and no JSON body, and a single re-ask usually
+        succeeds where the first call truncated.
+        """
+        messages = await self._render_messages(spec, handoff)
+        self._record(
+            handoff.task_id, handoff.step, "llm_call", spec.name,
+            {
+                "provider": spec.llm.provider,
+                "model": spec.llm.model,
+                "sla_seconds": spec.contract.sla_seconds,
+            },
+        )
+        for attempt in (1, 2):
+            try:
+                if spec.contract.sla_seconds:
+                    import asyncio as _aio
+
+                    resp = await _aio.wait_for(
+                        self.router.complete(messages, spec.llm),
+                        timeout=float(spec.contract.sla_seconds),
+                    )
+                else:
+                    resp = await self.router.complete(messages, spec.llm)
+            except TimeoutError as exc:
+                self._record(
+                    handoff.task_id, handoff.step, "error", spec.name,
+                    {"timeout": spec.contract.sla_seconds, "phase": "llm_call"},
+                )
+                raise SLAExceeded(spec.name, spec.contract.sla_seconds) from exc
+            try:
+                return self._parse_json_block(resp.text)
+            except ValueError:
+                if attempt >= 2:
+                    raise
+                self._record(
+                    handoff.task_id, handoff.step, "llm_retry", spec.name,
+                    {"reason": "unparseable_output", "snippet": resp.text[:120]},
+                )
+                # Tighten the reminder for the retry — no thinking tokens,
+                # JSON object only.
+                messages = [
+                    *messages,
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            "Your previous response was unparseable. "
+                            "Reply with ONLY the JSON object — no <think> "
+                            "tags, no commentary, no markdown fences."
+                        ),
+                    ),
+                ]
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _split_payload(
+        self, spec: AgentSpec, handoff: Handoff
+    ) -> list[dict[str, Any]]:
+        """Decide whether the rendered hop fits the budget. If not, split
+        the largest list-valued input field into chunks; non-list fields
+        are duplicated across chunks so each batch sees full context."""
+        budget_chars = int(
+            get_settings().llm_context_budget_tokens * _CHARS_PER_TOKEN
+        )
+        payload = handoff.payload
+        sys_chars = len(spec.system_prompt or "")
+        payload_chars = len(json.dumps(payload, default=str))
+        if sys_chars + payload_chars + _NON_PAYLOAD_CHARS <= budget_chars:
+            return [payload]
+        list_fields = [(k, v) for k, v in payload.items() if isinstance(v, list)]
+        if not list_fields:
+            return [payload]
+        largest_key, largest_val = max(
+            list_fields,
+            key=lambda kv: len(json.dumps(kv[1], default=str)),
+        )
+        if len(largest_val) < 2:
+            return [payload]
+        base = {k: v for k, v in payload.items() if k != largest_key}
+        base_chars = len(json.dumps(base, default=str))
+        available = budget_chars - sys_chars - base_chars - _NON_PAYLOAD_CHARS
+        if available < 1000:
+            # Base alone is over budget; we can't split usefully. Let the
+            # LLM see what it sees and fail loud.
+            return [payload]
+        largest_chars = len(json.dumps(largest_val, default=str))
+        chars_per_item = max(1, largest_chars // len(largest_val))
+        items_per_chunk = max(1, available // chars_per_item)
+        return [
+            {**base, largest_key: largest_val[i : i + items_per_chunk]}
+            for i in range(0, len(largest_val), items_per_chunk)
+        ]
+
+    def _merge_outputs(
+        self, spec: AgentSpec, partials: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Combine per-chunk outputs into a single contract-shaped dict.
+
+        Lists concatenate (the natural shape for batched results); strings
+        take the first non-empty value (avoids a 5x-long summary); booleans
+        AND together (conservative — every chunk must approve); numerics
+        keep the first non-None.
+        """
+        merged: dict[str, Any] = {}
+        for out in partials:
+            if not isinstance(out, dict):
+                continue
+            for k, v in out.items():
+                if k not in merged or merged[k] is None:
+                    merged[k] = v
+                    continue
+                cur = merged[k]
+                if isinstance(cur, list) and isinstance(v, list):
+                    merged[k] = cur + v
+                elif isinstance(cur, bool) and isinstance(v, bool):
+                    merged[k] = cur and v
+                elif isinstance(cur, (int, float)) and isinstance(v, (int, float)):
+                    # Keep first; merging numerics is too domain-specific.
+                    pass
+                elif isinstance(cur, str) and isinstance(v, str) and not cur and v:
+                    merged[k] = v
+                # Anything else: keep first.
+        return merged
 
     # ------------------------------------------------------------------
     # Enrichment

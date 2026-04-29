@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(3, alias="AGENTCORE_LLM_MAX_RETRIES")
     llm_max_concurrency: int = Field(4, alias="AGENTCORE_LLM_MAX_CONCURRENCY")
 
+    # Per-call context budget. ~200k tokens is the safe lowest-common-
+    # denominator across our supported models (Claude, Kimi K2, GLM-4.6,
+    # GPT-4o); when an agent's payload + system prompt + retrieval block
+    # would exceed this, Runtime splits the largest list-typed input field
+    # into chunks, runs the LLM per chunk, and merges outputs.
+    llm_context_budget_tokens: int = Field(
+        200_000, alias="AGENTCORE_LLM_CONTEXT_BUDGET_TOKENS"
+    )
+
     # Max wall-clock for an entire `/run` chain across all hops. Caps runaway
     # loops without clamping per-call throughput. Set 0 to disable.
     max_chain_seconds: int = Field(1800, alias="AGENTCORE_MAX_CHAIN_SECONDS")
