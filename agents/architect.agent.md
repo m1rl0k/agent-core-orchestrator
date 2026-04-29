@@ -35,7 +35,10 @@ contract:
     - { name: open_questions,    type: "list[string]",     required: false, description: "Items needing human decision" }
   accepts_handoff_from: [user, ops, qa]
   delegates_to: [developer]
-  sla_seconds: 120
+  # Runaway protection only — generous for thinking models that burn
+  # 30-90s on chain-of-thought before emitting tokens. Well-behaved
+  # planning runs finish in well under a minute.
+  sla_seconds: 600
 
 # ─── Knowledge bindings ───────────────────────────────────────────────────
 knowledge:

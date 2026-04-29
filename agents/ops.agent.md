@@ -33,7 +33,8 @@ contract:
     - { name: notes,           type: string,           required: false }
   accepts_handoff_from: [user, qa, architect]
   delegates_to: [architect]
-  sla_seconds: 300
+  # Runaway protection — pipeline + signal triage cycles.
+  sla_seconds: 600
 
 knowledge:
   rag_collections: [code, decisions, wiki]

@@ -31,7 +31,8 @@ contract:
     - { name: coverage_pct,  type: float,                 required: false }
   accepts_handoff_from: [developer]
   delegates_to: [developer, ops]
-  sla_seconds: 600
+  # Runaway protection — test design + execution on a thinking model.
+  sla_seconds: 1200
 
 knowledge:
   rag_collections: [code, wiki]

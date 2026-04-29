@@ -66,8 +66,16 @@ class Settings(BaseSettings):
     zai_base_url: str = Field("https://api.z.ai/api/paas/v4", alias="ZAI_BASE_URL")
 
     # LLM call timeout (applies to Anthropic, Azure, z.ai; boto3 owns Bedrock).
-    llm_timeout_seconds: float = Field(60.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
+    # Generous default — thinking models burn 30-90s on chain-of-thought
+    # before emitting. Per-agent SLA (`sla_seconds` in agent.md) is the
+    # outer wall-clock; this is the inner per-call cap.
+    llm_timeout_seconds: float = Field(300.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
     llm_max_retries: int = Field(3, alias="AGENTCORE_LLM_MAX_RETRIES")
+    llm_max_concurrency: int = Field(4, alias="AGENTCORE_LLM_MAX_CONCURRENCY")
+
+    # Max wall-clock for an entire `/run` chain across all hops. Caps runaway
+    # loops without clamping per-call throughput. Set 0 to disable.
+    max_chain_seconds: int = Field(1800, alias="AGENTCORE_MAX_CHAIN_SECONDS")
 
     # Provider priority — comma-separated list. The orchestrator picks the first
     # provider in this list whose credentials are populated when an agent's
@@ -189,6 +197,7 @@ class Settings(BaseSettings):
     # call here since this is high-volume and the agent has well-defined
     # output shape.
     wiki_curator_model: str = Field("glm-4.6", alias="AGENTCORE_WIKI_CURATOR_MODEL")
+    wiki_max_changed_paths: int = Field(200, alias="AGENTCORE_WIKI_MAX_CHANGED_PATHS")
 
 
 @lru_cache

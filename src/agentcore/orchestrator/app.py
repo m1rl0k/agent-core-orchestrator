@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 from agentcore.adapters.graphify import GraphifyAdapter
@@ -29,7 +29,7 @@ from agentcore.llm.router import LLMRouter
 from agentcore.logging_setup import configure_logging
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.runtime import Handoff as _H  # noqa: F401 - keep import shape
-from agentcore.orchestrator.runtime import HandoffRejected, Runtime
+from agentcore.orchestrator.runtime import HandoffRejected, Runtime, SLAExceeded
 from agentcore.orchestrator.traces import TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry, watch_agents_dir
@@ -76,10 +76,21 @@ class SignalIn(BaseModel):
 def build_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
+    if settings.host not in {"127.0.0.1", "localhost"} and not settings.api_token:
+        raise RuntimeError(
+            "AGENTCORE_API_TOKEN is required when AGENTCORE_HOST is not localhost"
+        )
 
     registry = AgentRegistry()
     traces = TraceLog()
     router = LLMRouter(settings)
+    from agentcore.state.idempotency import IdempotencyStore
+    from agentcore.state.jobs import JobQueue
+
+    idem_cache = IdempotencyStore(settings=settings)
+    job_queue = JobQueue(settings=settings)
+    job_queue.init_schema()  # best-effort; falls back to in-memory mode if no DB
+    job_handlers: dict[str, Any] = {}
     import contextlib
 
     graph = KnowledgeGraph(settings=settings)
@@ -122,16 +133,28 @@ def build_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        from agentcore.state.jobs import run_worker as _run_worker
+
         stop = asyncio.Event()
         watcher = asyncio.create_task(
             watch_agents_dir(settings.agents_dir, registry, stop_event=stop)
         )
+        # Drain the durable Postgres job queue if any handlers are registered
+        # (currently: wiki refresh). Falls back to in-memory mode when the DB
+        # isn't reachable; either way the queue is bounded.
+        worker = None
+        if job_handlers:
+            worker = asyncio.create_task(
+                _run_worker(job_queue, job_handlers, stop_event=stop)
+            )
         try:
             yield
         finally:
             save_graph_best_effort()
             stop.set()
             watcher.cancel()
+            if worker is not None:
+                worker.cancel()
 
     app = FastAPI(title="agent-core-orchestrator", lifespan=lifespan)
 
@@ -168,37 +191,75 @@ def build_app() -> FastAPI:
     async def capabilities() -> dict[str, Any]:
         return {name: cap.__dict__ for name, cap in detect_capabilities(settings).items()}
 
-    @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_api_token)])
-    async def run(req: RunRequest) -> RunResponse:
-        handoff = Handoff(
-            task_id=new_task_id(),
-            from_agent=req.from_agent,
-            to_agent=req.to_agent,
-            payload=req.payload,
-        )
+    async def _drive_chain(
+        first: Handoff, max_hops: int, chain: bool
+    ) -> list[dict[str, Any]]:
+        """Run the handoff chain. Wrapped by /run with `max_chain_seconds`."""
         hops: list[dict[str, Any]] = []
-        current: Handoff | None = handoff
-        for _ in range(req.max_hops):
+        current: Handoff | None = first
+        for _ in range(max_hops):
             if current is None:
                 break
-            try:
-                outcome, nxt = await runtime.execute(current)
-            except HandoffRejected as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            outcome, nxt = await runtime.execute(current)
             hops.append({
                 "agent": outcome.agent,
                 "status": outcome.status,
                 "output": outcome.output,
                 "delegate_to": outcome.delegate_to,
             })
-            if not (req.chain and nxt):
+            if not (chain and nxt):
                 break
             current = nxt
+        return hops
+
+    @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_api_token)])
+    async def run(
+        req: RunRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> RunResponse:
+        if idempotency_key:
+            cached = idem_cache.get("run", idempotency_key)
+            if cached is not None:
+                return RunResponse(**cached)
+        handoff = Handoff(
+            task_id=new_task_id(),
+            from_agent=req.from_agent,
+            to_agent=req.to_agent,
+            payload=req.payload,
+        )
+        chain_cap = settings.max_chain_seconds
+        try:
+            if chain_cap and chain_cap > 0:
+                hops = await asyncio.wait_for(
+                    _drive_chain(handoff, req.max_hops, req.chain),
+                    timeout=float(chain_cap),
+                )
+            else:
+                hops = await _drive_chain(handoff, req.max_hops, req.chain)
+        except HandoffRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SLAExceeded as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"chain exceeded max_chain_seconds={chain_cap}",
+            ) from exc
         save_graph_best_effort()
-        return RunResponse(task_id=handoff.task_id, hops=hops)
+        resp = RunResponse(task_id=handoff.task_id, hops=hops)
+        if idempotency_key:
+            idem_cache.put("run", idempotency_key, resp.model_dump())
+        return resp
 
     @app.post("/handoff", response_model=RunResponse, dependencies=[Depends(require_api_token)])
-    async def handoff_one(req: HandoffRequest) -> RunResponse:
+    async def handoff_one(
+        req: HandoffRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> RunResponse:
+        if idempotency_key:
+            cached = idem_cache.get("handoff", idempotency_key)
+            if cached is not None:
+                return RunResponse(**cached)
         handoff = Handoff(
             task_id=new_task_id(),
             from_agent=req.from_agent,
@@ -209,14 +270,26 @@ def build_app() -> FastAPI:
             outcome, _ = await runtime.execute(handoff)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SLAExceeded as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         save_graph_best_effort()
-        return RunResponse(
+        resp = RunResponse(
             task_id=handoff.task_id,
             hops=[{"agent": outcome.agent, "status": outcome.status, "output": outcome.output}],
         )
+        if idempotency_key:
+            idem_cache.put("handoff", idempotency_key, resp.model_dump())
+        return resp
 
     @app.post("/signal", dependencies=[Depends(require_api_token)])
-    async def receive_signal(sig: SignalIn) -> dict[str, Any]:
+    async def receive_signal(
+        sig: SignalIn,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if idempotency_key:
+            cached = idem_cache.get("signal", idempotency_key)
+            if cached is not None:
+                return cached
         # Signals route to Ops by convention; Ops decides whether to escalate.
         ops = registry.get("ops")
         if ops is None:
@@ -230,8 +303,13 @@ def build_app() -> FastAPI:
             outcome, _ = await runtime.execute(handoff)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SLAExceeded as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         save_graph_best_effort()
-        return {"task_id": handoff.task_id, "outcome": outcome.model_dump()}
+        resp = {"task_id": handoff.task_id, "outcome": outcome.model_dump()}
+        if idempotency_key:
+            idem_cache.put("signal", idempotency_key, resp)
+        return resp
 
     @app.get("/tasks/{task_id}/trace")
     async def trace(task_id: str) -> dict[str, Any]:
@@ -255,13 +333,15 @@ def build_app() -> FastAPI:
     # so the disabled mode keeps the surface minimal.
     # ----------------------------------------------------------------
     if settings.enable_wiki:
-        _register_wiki_routes(app, settings, router, require_api_token)
+        _register_wiki_routes(
+            app, settings, router, require_api_token, job_queue, job_handlers
+        )
 
     return app
 
 
 def _register_wiki_routes(  # type: ignore[no-untyped-def]
-    app: FastAPI, settings, router, require_api_token
+    app: FastAPI, settings, router, require_api_token, job_queue, job_handlers
 ) -> None:
     """Wire the living-wiki endpoints. Off-by-default; only invoked from
     `build_app` when `AGENTCORE_ENABLE_WIKI=true`."""
@@ -294,6 +374,22 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
     curator = WikiCurator(
         router, storage, index, curator_model=settings.wiki_curator_model
     )
+
+    # Register job handlers so the worker loop can drain wiki refresh jobs.
+    async def _h_seed(payload: dict[str, Any]) -> None:
+        await curator.seed_from_repo(
+            settings.graphify_repo_root, commit_sha=payload.get("commit_sha")
+        )
+
+    async def _h_incremental(payload: dict[str, Any]) -> None:
+        await curator.incremental(
+            payload.get("changed_paths") or [],
+            settings.graphify_repo_root,
+            commit_sha=payload.get("commit_sha"),
+        )
+
+    job_handlers["wiki.refresh.seed"] = _h_seed
+    job_handlers["wiki.refresh.incremental"] = _h_incremental
 
     # Stale-index startup warning. Pure / fast / no LLM calls; gives the
     # operator an immediate "your wiki is N pages behind the source" signal.
@@ -352,27 +448,18 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
             "body": page.body,
         }
 
-    async def _curator_seed(commit_sha: str | None) -> None:
-        try:
-            await curator.seed_from_repo(settings.graphify_repo_root, commit_sha=commit_sha)
-        except Exception as exc:
-            log.warning("wiki.bg_seed_failed", error=str(exc))
-
-    async def _curator_incremental(paths: list[str], commit_sha: str | None) -> None:
-        try:
-            await curator.incremental(
-                paths, settings.graphify_repo_root, commit_sha=commit_sha
-            )
-        except Exception as exc:
-            log.warning("wiki.bg_incremental_failed", error=str(exc))
-
     @app.post("/wiki/refresh", dependencies=[Depends(require_api_token)], status_code=202)
     async def wiki_refresh(
-        req: WikiRefreshIn, background: BackgroundTasks
+        req: WikiRefreshIn,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
-        """Enqueue a wiki refresh. Returns 202 immediately; curator runs
-        off-thread so git hooks / webhooks aren't blocked on the LLM call.
-        Lint mode is cheap and stays inline."""
+        """Enqueue a wiki refresh. Lint is cheap so stays inline.
+
+        Seed/incremental are pushed to the durable Postgres job queue —
+        git hooks / webhooks return 202 in milliseconds while the curator
+        drains off-thread. Idempotency-Key collapses duplicate enqueues
+        thanks to the partial unique index on (kind, idempotency_key).
+        """
         repo = settings.graphify_repo_root
         if req.mode == "lint":
             report = curator.lint(repo)
@@ -383,13 +470,27 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
                 "missing_coverage": report.missing_coverage,
             }
         if req.mode == "seed":
-            background.add_task(_curator_seed, req.commit_sha)
-            return {"mode": "seed", "status": "queued"}
+            jid = job_queue.enqueue(
+                "wiki.refresh.seed",
+                {"commit_sha": req.commit_sha},
+                idempotency_key=idempotency_key,
+                created_by="wiki/refresh",
+            )
+            return {"mode": "seed", "status": "queued", "job_id": jid}
         # default: incremental
-        background.add_task(
-            _curator_incremental, list(req.changed_paths), req.commit_sha
+        changed_paths = list(req.changed_paths)
+        if len(changed_paths) > settings.wiki_max_changed_paths:
+            raise HTTPException(
+                status_code=413,
+                detail=f"changed_paths exceeds limit {settings.wiki_max_changed_paths}",
+            )
+        jid = job_queue.enqueue(
+            "wiki.refresh.incremental",
+            {"changed_paths": changed_paths, "commit_sha": req.commit_sha},
+            idempotency_key=idempotency_key,
+            created_by="wiki/refresh",
         )
-        return {"mode": "incremental", "status": "queued"}
+        return {"mode": "incremental", "status": "queued", "job_id": jid}
 
 
 app = build_app()

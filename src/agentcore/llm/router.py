@@ -47,6 +47,7 @@ class LLMRouter:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._clients: dict[str, Any] = {}
+        self._semaphore = asyncio.Semaphore(max(1, int(self.settings.llm_max_concurrency)))
 
     # ---- shared knobs --------------------------------------------------
 
@@ -126,6 +127,14 @@ class LLMRouter:
     # ---- public --------------------------------------------------------
 
     async def complete(
+        self,
+        messages: list[ChatMessage],
+        model_config: ModelConfig,
+    ) -> LLMResponse:
+        async with self._semaphore:
+            return await self._complete_once(messages, model_config)
+
+    async def _complete_once(
         self,
         messages: list[ChatMessage],
         model_config: ModelConfig,

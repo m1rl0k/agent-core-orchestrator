@@ -32,7 +32,9 @@ contract:
     - { name: notes,        type: string,             required: false, description: "Implementation notes for QA / Architect" }
   accepts_handoff_from: [architect, qa]
   delegates_to: [qa]
-  sla_seconds: 600
+  # Runaway protection — multi-file diffs on thinking models can take a
+  # few minutes; this is the upper bound, not the target.
+  sla_seconds: 1200
 
 knowledge:
   rag_collections: [code, wiki]

@@ -112,3 +112,14 @@ def test_delete_returns_true_only_on_existing_page(tmp_path: Path) -> None:
     assert s.delete("x.md") is True
     assert s.delete("x.md") is False
     assert s.read("x.md") is None
+
+
+def test_rejects_path_traversal(tmp_path: Path) -> None:
+    s = _new_storage(tmp_path)
+    for rel in ("../outside.md", "modules/../../outside.md", "/tmp/outside.md"):
+        try:
+            s.page_path(rel)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - assertion branch
+            raise AssertionError(f"expected traversal rejection for {rel!r}")

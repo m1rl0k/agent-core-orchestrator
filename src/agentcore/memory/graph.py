@@ -102,6 +102,31 @@ CREATE INDEX IF NOT EXISTS idx_agentcore_graph_communities_detected
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_communities_type
   ON agentcore_graph_communities(community_type);
+
+CREATE TABLE IF NOT EXISTS agentcore_graph_events (
+  id BIGSERIAL PRIMARY KEY,
+  task_id TEXT,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '',
+  attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_task
+  ON agentcore_graph_events(task_id);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_actor
+  ON agentcore_graph_events(actor);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_action
+  ON agentcore_graph_events(action);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_created
+  ON agentcore_graph_events(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_attrs_gin
+  ON agentcore_graph_events USING GIN(attrs);
 """
 
 
@@ -146,6 +171,36 @@ class KnowledgeGraph:
             return
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(GRAPH_DDL)
+
+    def record_event(
+        self,
+        task_id: str | None,
+        actor: str,
+        action: str,
+        *,
+        subject: str = "",
+        **attrs: Any,
+    ) -> None:
+        """Append a time-series audit event for shared swarm memory."""
+        if not self.is_persistent:
+            events = self.g.graph.setdefault("events", [])
+            if isinstance(events, list):
+                events.append(
+                    {
+                        "task_id": task_id,
+                        "actor": actor,
+                        "action": action,
+                        "subject": subject,
+                        "attrs": attrs,
+                    }
+                )
+            return
+        sql = """
+        INSERT INTO agentcore_graph_events (task_id, actor, action, subject, attrs)
+        VALUES (%s, %s, %s, %s, %s::jsonb)
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (task_id, actor, action, subject, json.dumps(attrs)))
 
     # ---- generic mutation ----------------------------------------------
 
@@ -225,42 +280,81 @@ class KnowledgeGraph:
     # Stable node prefixes:
     #   agent:<name>     ·  task:<id>     ·  file:<rel_path>     ·  status:<name>
 
-    def record_handoff(self, task_id: str, from_agent: str, to_agent: str) -> None:
+    def record_handoff(
+        self,
+        task_id: str,
+        from_agent: str,
+        to_agent: str,
+        *,
+        created_by: str | None = None,
+    ) -> None:
         a, b = f"agent:{from_agent}", f"agent:{to_agent}"
         t = f"task:{task_id}"
+        actor = created_by or to_agent
         self.add_node(a, kind="agent")
         self.add_node(b, kind="agent")
-        self.add_node(t, kind="task")
-        self.add_edge(a, b, weight=1.0, relation="handoff")
-        self.add_edge(a, t, weight=1.0, relation="worked_on")
-        self.add_edge(b, t, weight=1.0, relation="worked_on")
+        self.add_node(t, kind="task", created_by=actor)
+        self.add_edge(a, b, weight=1.0, relation="handoff", task_id=task_id, created_by=actor)
+        self.add_edge(a, t, weight=1.0, relation="worked_on", task_id=task_id, created_by=actor)
+        self.add_edge(b, t, weight=1.0, relation="worked_on", task_id=task_id, created_by=actor)
+        self.record_event(
+            task_id,
+            actor,
+            "handoff",
+            subject=f"{from_agent}->{to_agent}",
+            from_agent=from_agent,
+            to_agent=to_agent,
+        )
 
-    def record_change(self, task_id: str, file_path: str) -> None:
+    def record_change(
+        self, task_id: str, file_path: str, *, created_by: str | None = None
+    ) -> None:
         t = f"task:{task_id}"
         f = f"file:{file_path}"
-        self.add_node(t, kind="task")
+        actor = created_by or "unknown"
+        self.add_node(t, kind="task", created_by=actor)
         self.add_node(f, kind="file", path=file_path)
-        self.add_edge(t, f, weight=1.0, relation="changed")
+        self.add_edge(t, f, weight=1.0, relation="changed", task_id=task_id, created_by=actor)
+        self.record_event(task_id, actor, "changed", subject=file_path)
 
-    def record_outcome(self, task_id: str, status: str) -> None:
+    def record_outcome(
+        self, task_id: str, status: str, *, created_by: str | None = None
+    ) -> None:
         t = f"task:{task_id}"
         s = f"status:{status}"
-        self.add_node(t, kind="task")
+        actor = created_by or "unknown"
+        self.add_node(t, kind="task", created_by=actor)
         self.add_node(s, kind="status", status=status)
-        self.add_edge(t, s, weight=1.0, relation="outcome")
+        self.add_edge(t, s, weight=1.0, relation="outcome", task_id=task_id, created_by=actor)
+        self.record_event(task_id, actor, "outcome", subject=status)
 
-    def record_impact(self, task_id: str, file_path: str, downstream: list[str]) -> None:
+    def record_impact(
+        self,
+        task_id: str,
+        file_path: str,
+        downstream: list[str],
+        *,
+        created_by: str | None = None,
+    ) -> None:
         """Wire a task to a file and that file's downstream symbols."""
         t = f"task:{task_id}"
         f = f"file:{file_path}"
-        self.add_node(t, kind="task")
+        actor = created_by or "graphify"
+        self.add_node(t, kind="task", created_by=actor)
         self.add_node(f, kind="file", path=file_path)
-        self.add_edge(t, f, weight=1.0, relation="changed")
+        self.add_edge(t, f, weight=1.0, relation="changed", task_id=task_id, created_by=actor)
         for sym in downstream:
             s = f"symbol:{sym}"
-            self.add_node(s, kind="symbol", symbol=sym)
-            self.add_edge(f, s, weight=0.5, relation="contains")
-            self.add_edge(t, s, weight=0.5, relation="blast_radius")
+            self.add_node(s, kind="symbol", symbol=sym, created_by=actor)
+            self.add_edge(f, s, weight=0.5, relation="contains", task_id=task_id, created_by=actor)
+            self.add_edge(t, s, weight=0.5, relation="blast_radius", task_id=task_id, created_by=actor)
+        self.record_event(
+            task_id,
+            actor,
+            "impact",
+            subject=file_path,
+            downstream_count=len(downstream),
+        )
 
     def record_snippet(
         self,
@@ -272,8 +366,10 @@ class KnowledgeGraph:
         content: str,
         intent: str = "",
         role: str = "",
+        created_by: str | None = None,
     ) -> str:
         """Persist a code snippet produced/touched by a task."""
+        actor = created_by or role or "unknown"
         node = f"snippet:{file_path}:{start}-{end}#{task_id}"
         self.add_node(
             node,
@@ -284,14 +380,24 @@ class KnowledgeGraph:
             content=content[:4000],
             intent=intent,
             role=role,
+            created_by=actor,
             relevance="pending",
         )
         t = f"task:{task_id}"
         f = f"file:{file_path}"
-        self.add_node(t, kind="task")
+        self.add_node(t, kind="task", created_by=actor)
         self.add_node(f, kind="file", path=file_path)
-        self.add_edge(t, node, weight=1.0, relation="produced")
-        self.add_edge(f, node, weight=1.0, relation="contains_snippet")
+        self.add_edge(t, node, weight=1.0, relation="produced", task_id=task_id, created_by=actor)
+        self.add_edge(f, node, weight=1.0, relation="contains_snippet", task_id=task_id, created_by=actor)
+        self.record_event(
+            task_id,
+            actor,
+            "snippet",
+            subject=node,
+            file=file_path,
+            start=start,
+            end=end,
+        )
         return node
 
     # ---- labels / PRF ----------------------------------------------------
@@ -312,13 +418,20 @@ class KnowledgeGraph:
             cur.execute(sql, (json.dumps(labels), node))
 
     def tag_relevance(
-        self, task_id: str, label: str, *, score: float = 1.0, reason: str = ""
+        self,
+        task_id: str,
+        label: str,
+        *,
+        score: float = 1.0,
+        reason: str = "",
+        created_by: str | None = None,
     ) -> int:
         """Append a PRF label to every snippet a task produced."""
         from agentcore.memory.prf import now as _now
 
         t = f"task:{task_id}"
-        record = {"score": float(score), "reason": reason, "at": _now()}
+        actor = created_by or "unknown"
+        record = {"score": float(score), "reason": reason, "at": _now(), "created_by": actor}
         label_patch = {label: record}
         tagged = 0
 
@@ -347,18 +460,39 @@ class KnowledgeGraph:
             rows = cur.fetchall()
         for row in rows:
             self._merge_node_labels(str(row[0]), label_patch)
-        return len(rows)
+        count = len(rows)
+        self.record_event(
+            task_id,
+            actor,
+            "tag_relevance",
+            subject=label,
+            score=float(score),
+            reason=reason,
+            tagged=count,
+        )
+        return count
 
     def tag_task(
-        self, task_id: str, label: str, *, score: float = 1.0, reason: str = ""
+        self,
+        task_id: str,
+        label: str,
+        *,
+        score: float = 1.0,
+        reason: str = "",
+        created_by: str | None = None,
     ) -> None:
         """Tag a task node directly (independent of its snippets)."""
         from agentcore.memory.prf import now as _now
 
         t = f"task:{task_id}"
+        actor = created_by or "unknown"
         if t not in self.g and not self.is_persistent:
             return
-        self._merge_node_labels(t, {label: {"score": float(score), "reason": reason, "at": _now()}})
+        self._merge_node_labels(
+            t,
+            {label: {"score": float(score), "reason": reason, "at": _now(), "created_by": actor}},
+        )
+        self.record_event(task_id, actor, "tag_task", subject=label, score=float(score), reason=reason)
 
     # ---- retrieval-shaped reads ----------------------------------------
 

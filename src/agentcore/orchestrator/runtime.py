@@ -42,6 +42,23 @@ class HandoffRejected(RuntimeError):
     pass
 
 
+class SLAExceeded(RuntimeError):
+    """Raised when a hop blows past its `sla_seconds` budget.
+
+    Throughput note: SLA is enforced via `asyncio.wait_for`, which cancels
+    the in-flight LLM call cleanly. We deliberately do NOT clamp tokens or
+    model size — the budget is wall-clock only — so high-throughput agent
+    loops can run as fast as the upstream LLM can emit.
+    """
+
+    def __init__(self, agent: str, sla_seconds: int | None) -> None:
+        self.agent = agent
+        self.sla_seconds = sla_seconds
+        super().__init__(
+            f"agent {agent!r} exceeded sla of {sla_seconds}s during LLM call"
+        )
+
+
 class Runtime:
     def __init__(
         self,
@@ -84,11 +101,27 @@ class Runtime:
                          {"contract": exc.errors})
             raise
 
-        # 3. LLM call
+        # 3. LLM call (with optional SLA enforcement)
         messages = await self._render_messages(spec, handoff)
         self._record(handoff.task_id, handoff.step, "llm_call", spec.name,
-                     {"provider": spec.llm.provider, "model": spec.llm.model})
-        resp = await self.router.complete(messages, spec.llm)
+                     {"provider": spec.llm.provider, "model": spec.llm.model,
+                      "sla_seconds": spec.contract.sla_seconds})
+        try:
+            if spec.contract.sla_seconds:
+                import asyncio as _aio
+
+                resp = await _aio.wait_for(
+                    self.router.complete(messages, spec.llm),
+                    timeout=float(spec.contract.sla_seconds),
+                )
+            else:
+                resp = await self.router.complete(messages, spec.llm)
+        except TimeoutError as exc:
+            self._record(
+                handoff.task_id, handoff.step, "error", spec.name,
+                {"timeout": spec.contract.sla_seconds, "phase": "llm_call"},
+            )
+            raise SLAExceeded(spec.name, spec.contract.sla_seconds) from exc
 
         # 4. Parse + validate output
         output = self._parse_json_block(resp.text)
