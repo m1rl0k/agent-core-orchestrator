@@ -305,9 +305,10 @@ def plan(
     ),
     repo: Path = typer.Option(Path("."), help="Repo root for --apply / --pr"),
     max_review_loops: int = typer.Option(
-        10,
-        help="Max review iterations before giving up. Pass 0 for unlimited "
-        "(developer keeps revising until every reviewer approves).",
+        0,
+        help="Cap on review iterations. Default 0 = unlimited (loop until "
+        "every reviewer approves). Set to a positive int to enforce a "
+        "ceiling, e.g. `--max-review-loops 5` for CI safety.",
     ),
     as_json: bool = typer.Option(
         False,
@@ -346,7 +347,7 @@ async def _plan_async(
     apply: bool = True,
     pr: bool = False,
     repo: Path = Path("."),
-    max_review_loops: int = 2,
+    max_review_loops: int = 0,
     as_json: bool = False,
 ) -> None:
     # JSON mode: suppress every rich panel along the way (set
@@ -375,7 +376,7 @@ async def _plan_async_body(
     apply: bool = True,
     pr: bool = False,
     repo: Path = Path("."),
-    max_review_loops: int = 2,
+    max_review_loops: int = 0,
     as_json: bool = False,
 ) -> None:
     from agentcore.memory import prf
@@ -907,6 +908,109 @@ def _open_github_pr(
 # ---------------------------------------------------------------------------
 # serve
 # ---------------------------------------------------------------------------
+
+
+@app.command()
+def tail(
+    chain_id: str = typer.Argument(..., help="Chain / task id to follow"),
+    url: str = typer.Option(
+        "", help="Orchestrator URL (default: built from AGENTCORE_HOST/PORT)"
+    ),
+    interval: float = typer.Option(
+        1.0, help="Poll interval in seconds"
+    ),
+) -> None:
+    """Stream trace events for an in-flight chain in real time.
+
+    Polls the orchestrator's `/chains/{id}` and `/tasks/{id}/trace`
+    endpoints, prints each new event with the same colour scheme as
+    the `plan` command, and exits when the chain reaches a terminal
+    status (done / failed / cancelled).
+    """
+    import time
+
+    import httpx
+
+    settings = get_settings()
+    base = url or f"http://{settings.host}:{settings.port}"
+    headers = {}
+    if settings.api_token:
+        headers["Authorization"] = f"Bearer {settings.api_token}"
+
+    console.print(
+        Panel(
+            f"[bold cyan]chain[/bold cyan] {chain_id}\n"
+            f"[bold cyan]url[/bold cyan]   {base}",
+            title="agentcore · tail",
+            border_style="cyan",
+        )
+    )
+
+    seen = 0
+    last_status = ""
+    try:
+        with httpx.Client(timeout=30.0, headers=headers) as client:
+            while True:
+                try:
+                    tr = client.get(f"{base}/tasks/{chain_id}/trace")
+                    if tr.status_code == 200:
+                        events = tr.json().get("events", [])
+                        for evt in events[seen:]:
+                            _render_trace_event(evt)
+                        seen = len(events)
+                    cr = client.get(f"{base}/chains/{chain_id}")
+                    status = (
+                        cr.json().get("status", "running")
+                        if cr.status_code == 200
+                        else "running"
+                    )
+                except httpx.RequestError as exc:
+                    if last_status != f"err:{exc}":
+                        console.print(f"[yellow]waiting…[/yellow] {exc}")
+                        last_status = f"err:{exc}"
+                    status = "running"
+
+                if status in ("done", "failed", "cancelled"):
+                    border = (
+                        "green" if status == "done"
+                        else "red" if status == "failed"
+                        else "yellow"
+                    )
+                    console.rule(
+                        f"[bold {border}]chain {status}[/bold {border}]"
+                    )
+                    break
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("[yellow]tail stopped[/yellow]")
+
+
+def _render_trace_event(evt: dict) -> None:
+    """Color-code one trace event for the tail stream."""
+    kind = evt.get("kind", "?")
+    actor = evt.get("actor", "?")
+    step = evt.get("step", "?")
+    detail = evt.get("detail") or {}
+    palette = {
+        "handoff_in":  "cyan",
+        "llm_call":    "yellow",
+        "outcome":     "green",
+        "error":       "red",
+        "batch_split": "blue",
+        "batch_chunk": "blue",
+        "executor":    "magenta",
+        "discovery":   "magenta",
+        "llm_retry":   "yellow",
+    }
+    color = palette.get(kind, "white")
+    bits = [f"[bold {color}]{kind:11s}[/bold {color}]", f"step {step}"]
+    bits.append(f"[bold]{actor}[/bold]")
+    for k, v in detail.items():
+        s = str(v)
+        if len(s) > 60:
+            s = s[:57] + "…"
+        bits.append(f"[dim]{k}=[/dim]{s}")
+    console.print(" ".join(bits))
 
 
 @app.command()
