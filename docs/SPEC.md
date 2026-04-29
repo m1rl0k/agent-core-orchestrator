@@ -41,7 +41,9 @@ contract:
     - { name: brief,   type: string,         required: true }
     - { name: context, type: ContextBundle,  required: false }
   outputs:
-    - { name: plan,    type: TechnicalPlan,  required: true }
+    - { name: summary,         type: string,           required: true }
+    - { name: files_to_change, type: list[FileChange], required: true }
+    - { name: risks,           type: list[string],     required: false }
   accepts_handoff_from: [user, ops, qa]
   delegates_to: [developer]
   sla_seconds: 120
@@ -61,7 +63,7 @@ provided context bundle, and produce a `TechnicalPlan` …
 
 - `accepts_handoff_from` — a whitelist; any inbound handoff from a role not in this list is rejected by the orchestrator before the agent is invoked.
 - `delegates_to` — symmetric; the agent may only emit a handoff whose `to_agent` is in this list.
-- `inputs` / `outputs` — referenced types must exist in `agentcore.contracts.domain` (or be primitive). Payloads are validated against these schemas, both inbound and outbound.
+- `inputs` / `outputs` — referenced types must exist in `agentcore.contracts.domain` (or be primitive). Payloads are validated against these schemas, both inbound and outbound. Parametric containers are supported: `list[<inner>]` and `dict[str, <inner>]` where `<inner>` is a primitive (`string`, `int`, `float`, `bool`) or a domain type — every element is validated, not just the container.
 - `sla_seconds` — soft deadline; runtime emits a warning trace but does not hard-kill.
 
 ## Handoff envelope

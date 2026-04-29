@@ -25,10 +25,10 @@ contract:
     - { name: diffs,        type: list,   required: true }
     - { name: notes,        type: string, required: false }
   outputs:
-    - { name: suite_summary, type: string, required: true }
-    - { name: passed,        type: list,   required: true }
-    - { name: failed,        type: list,   required: true }
-    - { name: coverage_pct,  type: float,  required: false }
+    - { name: suite_summary, type: string,             required: true }
+    - { name: passed,        type: list[string],       required: true }
+    - { name: failed,        type: list[FailedCase],   required: true }
+    - { name: coverage_pct,  type: float,              required: false }
   accepts_handoff_from: [developer]
   delegates_to: [developer, ops]
   sla_seconds: 600

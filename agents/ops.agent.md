@@ -26,11 +26,11 @@ contract:
     - { name: failed,        type: list,   required: false }
     - { name: signal,        type: Signal, required: false, description: "Set when invoked from a webhook/scan" }
   outputs:
-    - { name: target_branch,   type: string, required: true }
-    - { name: pipeline_status, type: string, required: true }
-    - { name: commit_sha,      type: string, required: false }
-    - { name: artifacts,       type: list,   required: false }
-    - { name: notes,           type: string, required: false }
+    - { name: target_branch,   type: string,        required: true }
+    - { name: pipeline_status, type: string,        required: true }
+    - { name: commit_sha,      type: string,        required: false }
+    - { name: artifacts,       type: list[string],  required: false }
+    - { name: notes,           type: string,        required: false }
   accepts_handoff_from: [user, qa, architect]
   delegates_to: [architect]
   sla_seconds: 300

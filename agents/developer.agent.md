@@ -27,9 +27,9 @@ contract:
     - { name: test_strategy,   type: string, required: false }
     - { name: context,         type: ContextBundle, required: false }
   outputs:
-    - { name: plan_summary, type: string, required: true,  description: "Echo of the plan summary you implemented" }
-    - { name: diffs,        type: list,   required: true,  description: "List of FileDiff objects (path + unified_diff)" }
-    - { name: notes,        type: string, required: false, description: "Implementation notes for QA / Architect" }
+    - { name: plan_summary, type: string,           required: true,  description: "Echo of the plan summary you implemented" }
+    - { name: diffs,        type: list[FileDiff],   required: true,  description: "List of FileDiff objects (path + unified_diff)" }
+    - { name: notes,        type: string,           required: false, description: "Implementation notes for QA / Architect" }
   accepts_handoff_from: [architect, qa]
   delegates_to: [qa]
   sla_seconds: 600

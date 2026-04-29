@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     zai_api_key: str | None = Field(None, alias="ZAI_API_KEY")
     zai_base_url: str = Field("https://api.z.ai/api/paas/v4", alias="ZAI_BASE_URL")
 
+    # LLM call timeout (applies to Anthropic, Azure, z.ai; boto3 owns Bedrock).
+    llm_timeout_seconds: float = Field(60.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
+    llm_max_retries: int = Field(3, alias="AGENTCORE_LLM_MAX_RETRIES")
+
     # ------------------------------------------------------------------
     # Optional integrations (host-credentialed). Each adapter rides on
     # the equivalent CLI already installed and authenticated on the host:

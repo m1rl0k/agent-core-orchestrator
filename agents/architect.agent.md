@@ -28,11 +28,11 @@ contract:
     - { name: brief,   type: string,        required: true,  description: "User goal or failing-test description" }
     - { name: context, type: ContextBundle, required: false, description: "Retrieval results from the codebase + docs" }
   outputs:
-    - { name: summary,           type: string, required: true,  description: "One-paragraph plan summary" }
-    - { name: files_to_change,   type: list,   required: true,  description: "List of FileChange objects" }
-    - { name: risks,             type: list,   required: false, description: "Known risks / unknowns" }
-    - { name: test_strategy,     type: string, required: false, description: "How QA should validate" }
-    - { name: open_questions,    type: list,   required: false, description: "Items needing human decision" }
+    - { name: summary,           type: string,            required: true,  description: "One-paragraph plan summary" }
+    - { name: files_to_change,   type: list[FileChange],  required: true,  description: "List of FileChange objects" }
+    - { name: risks,             type: list[string],      required: false, description: "Known risks / unknowns" }
+    - { name: test_strategy,     type: string,            required: false, description: "How QA should validate" }
+    - { name: open_questions,    type: list[string],      required: false, description: "Items needing human decision" }
   accepts_handoff_from: [user, ops, qa]
   delegates_to: [developer]
   sla_seconds: 120
