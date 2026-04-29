@@ -266,12 +266,60 @@ def plan(
     brief: str = typer.Argument(..., help="What you want done"),
     chain: bool = typer.Option(True, help="Auto-chain Architect → Developer → QA"),
     max_hops: int = typer.Option(6, help="Cap on chained hops"),
+    review: bool = typer.Option(
+        True,
+        "--review/--no-review",
+        help="After the chain completes, ask every role for a ReviewVerdict. "
+        "If any rejects, route back (architect|developer|qa) with the "
+        "blockers and re-run the relevant slice. Iterates up to "
+        "`--max-review-loops` times. Default ON.",
+    ),
+    apply: bool = typer.Option(
+        True,
+        "--apply/--no-apply",
+        help="Actually apply the developer's unified diffs to disk via "
+        "`git apply` once approved. Default ON. Use `--no-apply` for a "
+        "dry-run that stops at the verdicts.",
+    ),
+    pr: bool = typer.Option(
+        False,
+        "--pr",
+        help="Open a GitHub PR after applying. Requires AGENTCORE_ENABLE_GITHUB=true "
+        "and an authenticated `gh` on the host.",
+    ),
+    repo: Path = typer.Option(Path("."), help="Repo root for --apply / --pr"),
+    max_review_loops: int = typer.Option(
+        2, help="Max review iterations before giving up"
+    ),
 ) -> None:
-    """Run the role mesh end-to-end on this repo."""
-    asyncio.run(_plan_async(brief, chain, max_hops))
+    """Run the role mesh end-to-end on this repo.
+
+    Default workflow: chain → review round → if any blockers, route back &
+    re-run → apply once unanimous → optionally open a PR.
+    """
+    asyncio.run(_plan_async(
+        brief,
+        chain,
+        max_hops,
+        review=review,
+        apply=apply,
+        pr=pr,
+        repo=repo,
+        max_review_loops=max_review_loops,
+    ))
 
 
-async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
+async def _plan_async(
+    brief: str,
+    chain: bool,
+    max_hops: int,
+    *,
+    review: bool = True,
+    apply: bool = True,
+    pr: bool = False,
+    repo: Path = Path("."),
+    max_review_loops: int = 2,
+) -> None:
     from agentcore.memory import prf
     from agentcore.memory.graph import KnowledgeGraph
 
@@ -301,60 +349,340 @@ async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
         if settings.enable_graphify
         else None
     )
-    # Best-effort retriever: only if pgvector + fastembed are usable.
     from agentcore.retrieval.factory import try_build_retriever
 
     retriever = try_build_retriever(settings, graph)
     if retriever is None:
-        console.print("[yellow]retriever offline (see structured logs); plans will run without semantic context[/yellow]")
+        console.print(
+            "[yellow]retriever offline (see structured logs); plans will run "
+            "without semantic context[/yellow]"
+        )
 
     runtime = Runtime(
         registry=registry, router=router, traces=traces,
         graph=graph, graphify=graphify, retriever=retriever,
     )
 
+    state, task_id = await _run_chain(runtime, brief, chain, max_hops)
+
+    # Review loop — default ON. If any role rejects, route back to the
+    # most-relevant role with the aggregated blockers and re-run that
+    # slice. Cap at `max_review_loops` so we never spin forever.
+    verdicts: list[dict] = []
+    if review and state.get("dev_output"):
+        for loop_idx in range(max_review_loops + 1):
+            verdicts = await _run_review_round(router, registry, state)
+            console.rule(f"[bold]review round {loop_idx + 1}[/bold]")
+            for v in verdicts:
+                badge = "[green]approved[/green]" if v["approved"] else "[red]rejected[/red]"
+                console.print(f"  {v['agent']:10s} {badge}  {v.get('comments', '')[:80]}")
+                for b in v.get("blockers", [])[:3]:
+                    console.print(f"      ✗ {b}")
+            if all(v["approved"] for v in verdicts):
+                console.print("[bold green]all roles approved[/bold green]")
+                break
+            if loop_idx >= max_review_loops:
+                console.print(
+                    f"[yellow]max review loops ({max_review_loops}) reached without "
+                    "unanimous approval — not applying[/yellow]"
+                )
+                apply = False
+                break
+            # Route back to whichever role the first rejecter pointed at.
+            blockers = [b for v in verdicts if not v["approved"] for b in v.get("blockers", [])]
+            target = next(
+                (v.get("route_back_to", "architect") for v in verdicts if not v["approved"]),
+                "architect",
+            )
+            console.print(
+                f"[yellow]routing back to {target}[/yellow] with "
+                f"{len(blockers)} blocker(s)"
+            )
+            state, task_id = await _run_chain(
+                runtime,
+                _compose_revision_brief(brief, blockers, state),
+                chain,
+                max_hops,
+                start_at=target,
+            )
+
+    applied: list[str] = []
+    if apply and state.get("dev_output"):
+        diffs = state["dev_output"].get("diffs") or []
+        applied = _apply_diffs(repo, diffs)
+        if applied:
+            console.print(f"[green]applied {len(applied)} file(s):[/green] " + ", ".join(applied))
+        else:
+            console.print("[yellow]no diffs applied[/yellow]")
+
+    if pr and applied:
+        url = _open_github_pr(repo, brief, state, task_id)
+        if url:
+            console.print(f"[green]PR opened:[/green] {url}")
+
+    # Chain-end PRF tagging.
+    if state.get("qa_output") is not None:
+        out = state["qa_output"]
+        if out.get("failed"):
+            graph.tag_relevance(task_id, prf.QA_FAILED,
+                                score=float(len(out["failed"])),
+                                reason="qa returned failures")
+            graph.tag_task(task_id, prf.DEV_REVISED)
+        else:
+            graph.tag_relevance(task_id, prf.QA_PASSED)
+            graph.tag_task(task_id, prf.POSITIVE)
+
+    graph.save()
+
+
+# ---------------------------------------------------------------------------
+# Plan helpers — chain orchestration, review round, diff apply, PR
+# ---------------------------------------------------------------------------
+
+
+async def _run_chain(
+    runtime,  # type: ignore[no-untyped-def]
+    brief: str,
+    chain: bool,
+    max_hops: int,
+    *,
+    start_at: str = "architect",
+) -> tuple[dict, str]:
+    """Drive the role mesh from `start_at`. Captures each role's output by name."""
     handoff = Handoff(
         task_id=new_task_id(),
         from_agent="user",
-        to_agent="architect",
+        to_agent=start_at,
         payload={"brief": brief},
     )
-    console.print(f"[bold]task {handoff.task_id}[/bold]")
-
-    final_outcome = None
+    console.print(f"[bold]task {handoff.task_id}[/bold]  starting at {start_at}")
+    state: dict = {}
     current: Handoff | None = handoff
     for _ in range(max_hops):
         if current is None:
             break
         outcome, nxt = await runtime.execute(current)
-        final_outcome = outcome
+        state[f"{outcome.agent}_output"] = outcome.output
         console.rule(f"[bold]{outcome.agent}[/bold] · {outcome.status}")
-        console.print_json(json.dumps(outcome.output))
+        try:
+            console.print_json(json.dumps(outcome.output))
+        except (TypeError, ValueError):
+            console.print(str(outcome.output)[:1000])
         if not (chain and nxt):
             break
         current = nxt
+    return state, handoff.task_id
 
-    # Chain-end PRF tagging.
-    if final_outcome is not None:
-        out = final_outcome.output
-        if final_outcome.agent == "qa":
-            failed = out.get("failed") or []
-            if failed:
-                graph.tag_relevance(handoff.task_id, prf.QA_FAILED,
-                                    score=float(len(failed)),
-                                    reason="qa returned failures")
-                graph.tag_task(handoff.task_id, prf.DEV_REVISED)
-            else:
-                graph.tag_relevance(handoff.task_id, prf.QA_PASSED)
-                graph.tag_task(handoff.task_id, prf.POSITIVE)
-        elif final_outcome.agent == "ops":
-            status = str(out.get("pipeline_status", ""))
-            if status == "passed":
-                graph.tag_task(handoff.task_id, prf.SHIPPED)
-            elif status == "failed":
-                graph.tag_task(handoff.task_id, prf.OPS_BLOCKED)
 
-    graph.save()
+async def _run_review_round(
+    router,  # type: ignore[no-untyped-def]
+    registry,  # type: ignore[no-untyped-def]
+    state: dict,
+) -> list[dict]:
+    """Ask every loaded SDLC role for a ReviewVerdict on the current state.
+
+    Each agent's persona shapes its verdict — architect on minimality,
+    developer on patch correctness, qa on test coverage, ops on shipping
+    safety. Returns one dict per agent (parallel of ReviewVerdict).
+    """
+    from agentcore.llm.router import ChatMessage
+
+    payload_summary = json.dumps(
+        {
+            "plan": state.get("architect_output"),
+            "patch": state.get("developer_output"),
+            "qa_report": state.get("qa_output"),
+        },
+        default=str,
+    )[:8000]
+
+    review_roles = [r for r in ("architect", "developer", "qa", "ops") if registry.get(r)]
+    verdicts: list[dict] = []
+    for role in review_roles:
+        spec = registry.get(role)
+        if spec is None:
+            continue
+        sys = (
+            f"You are the {spec.soul.role}. Voice: {spec.soul.voice}. "
+            f"Values: {', '.join(spec.soul.values)}. "
+            "You are reviewing a proposed change. Respond ONLY with a JSON object "
+            "matching the ReviewVerdict schema:\n"
+            "{\n"
+            f'  "agent": "{role}",\n'
+            '  "approved": <true if you would ship this, false otherwise>,\n'
+            '  "blockers": [<list of strings, one per concrete blocker; empty if approved>],\n'
+            '  "comments": "<one-sentence summary>",\n'
+            '  "route_back_to": "<architect|developer|qa|ops>"\n'
+            "}\n"
+            "Be honest. Reject if you'd reject in real review. Set "
+            "`route_back_to` to the role best able to address the blockers "
+            "(architect for plan-level, developer for patch-level, qa for "
+            "test gaps)."
+        )
+        user = (
+            "Here is the current chain state. Review and emit a verdict.\n\n"
+            f"```json\n{payload_summary}\n```"
+        )
+        try:
+            resp = await router.complete(
+                [ChatMessage(role="system", content=sys),
+                 ChatMessage(role="user", content=user)],
+                spec.llm,
+            )
+        except Exception as exc:
+            verdicts.append({
+                "agent": role,
+                "approved": False,
+                "blockers": [f"review call failed: {exc}"],
+                "comments": "review aborted",
+                "route_back_to": "architect",
+            })
+            continue
+        # Parse the JSON object, lenient.
+        import re
+
+        match = re.search(r"\{.*\}", resp.text, re.DOTALL)
+        if not match:
+            verdicts.append({
+                "agent": role,
+                "approved": False,
+                "blockers": [f"non-JSON review output: {resp.text[:200]!r}"],
+                "comments": "could not parse",
+                "route_back_to": "architect",
+            })
+            continue
+        try:
+            v = json.loads(match.group(0))
+            v.setdefault("agent", role)
+            v.setdefault("blockers", [])
+            v.setdefault("comments", "")
+            v.setdefault("route_back_to", "architect")
+            verdicts.append(v)
+        except json.JSONDecodeError as exc:
+            verdicts.append({
+                "agent": role,
+                "approved": False,
+                "blockers": [f"JSON decode failed: {exc}"],
+                "comments": "",
+                "route_back_to": "architect",
+            })
+    return verdicts
+
+
+def _compose_revision_brief(
+    original_brief: str, blockers: list[str], state: dict
+) -> str:
+    bullets = "\n".join(f"  - {b}" for b in blockers[:20])
+    return (
+        f"{original_brief}\n\n"
+        "PRIOR ATTEMPT WAS REJECTED IN REVIEW. Address these blockers in the "
+        "revised plan/patch:\n"
+        f"{bullets}\n\n"
+        "Keep the change minimal; do not introduce unrelated edits."
+    )
+
+
+def _apply_diffs(repo: Path, diffs: list[dict]) -> list[str]:
+    """Apply each FileDiff via `git apply`. Falls back to direct overwrite for
+    diffs whose context anchors don't match the file (LLMs sometimes invent
+    context lines). Returns the list of paths actually written.
+    """
+    import contextlib
+    import subprocess
+    import tempfile
+
+    repo = Path(repo).resolve()
+    written: list[str] = []
+    for d in diffs:
+        path = d.get("path") if isinstance(d, dict) else None
+        diff_text = d.get("unified_diff") if isinstance(d, dict) else None
+        if not path or not diff_text:
+            continue
+        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as tmp:
+            tmp.write(diff_text)
+            patch_path = tmp.name
+        try:
+            check = subprocess.run(
+                ["git", "-C", str(repo), "apply", "--check", patch_path],
+                capture_output=True,
+                text=True,
+            )
+            if check.returncode == 0:
+                applied = subprocess.run(
+                    ["git", "-C", str(repo), "apply", patch_path],
+                    capture_output=True,
+                    text=True,
+                )
+                if applied.returncode == 0:
+                    written.append(path)
+                    continue
+            # Fallback: extract the post-image (every line starting with '+'
+            # except '+++') and overwrite the file. Lossy but functional when
+            # the LLM gave us a diff with bad context but a clear new state.
+            new_lines = [
+                line[1:] for line in diff_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            ]
+            if new_lines:
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                written.append(path + " (overwrite-fallback)")
+        finally:
+            with contextlib.suppress(OSError):
+                Path(patch_path).unlink()
+    return written
+
+
+def _open_github_pr(
+    repo: Path, brief: str, state: dict, task_id: str
+) -> str | None:
+    """Branch + commit + open PR via `gh`. Returns the URL on success.
+
+    Skipped silently if AGENTCORE_ENABLE_GITHUB is false or the gh capability
+    isn't ready — caller decides whether to surface that.
+    """
+    import subprocess
+
+    settings = get_settings()
+    if not settings.enable_github:
+        console.print("[yellow]--pr requested but AGENTCORE_ENABLE_GITHUB=false[/yellow]")
+        return None
+    repo = Path(repo).resolve()
+    branch = f"agentcore/plan/{task_id[:8]}"
+    title = brief.splitlines()[0][:70]
+    body_lines = [
+        f"Generated by agentcore (task `{task_id}`).",
+        "",
+        "## Plan",
+        f"```json\n{json.dumps(state.get('architect_output'), indent=2, default=str)[:2000]}\n```",
+        "",
+        "## QA",
+        f"```json\n{json.dumps(state.get('qa_output'), indent=2, default=str)[:2000]}\n```",
+    ]
+    body = "\n".join(body_lines)
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-b", branch],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", title],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "push", "-u", "origin", branch],
+            check=True, capture_output=True, text=True,
+        )
+        result = subprocess.run(
+            ["gh", "pr", "create", "--title", title, "--body", body, "--draft"],
+            check=True, capture_output=True, text=True, cwd=str(repo),
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]PR open failed:[/red] {exc.stderr or exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------

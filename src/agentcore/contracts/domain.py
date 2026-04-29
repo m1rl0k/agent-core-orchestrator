@@ -181,6 +181,28 @@ class RemediationProposal(BaseModel):
     notes: str = ""
 
 
+class ReviewVerdict(BaseModel):
+    """One agent's verdict on a proposed patch + test suite.
+
+    The chain's review round collects one verdict per role; if any role
+    rejects, blockers are aggregated and the chain re-runs starting at
+    the agent best suited to address them (architect for plan-level
+    issues, developer for patch-level, qa for test gaps). Loops cap at
+    `max_review_loops` so we never spin forever.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    approved: bool
+    blockers: list[str] = Field(default_factory=list)
+    comments: str = ""
+    # Where the chain should restart if `approved=False`. Defaults to
+    # 'architect' for plan-level concerns; reviewer can route to
+    # 'developer' (patch-level) or 'qa' (test-gap) instead.
+    route_back_to: Literal["architect", "developer", "qa", "ops"] = "architect"
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -199,6 +221,7 @@ DOMAIN_TYPES: dict[str, type[BaseModel]] = {
     "OpsReport": OpsReport,
     "Signal": Signal,
     "RemediationProposal": RemediationProposal,
+    "ReviewVerdict": ReviewVerdict,
 }
 
 PRIMITIVE_TYPES: set[str] = {"string", "int", "float", "bool", "dict", "list"}
