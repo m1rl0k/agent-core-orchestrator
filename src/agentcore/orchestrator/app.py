@@ -219,14 +219,40 @@ def build_app() -> FastAPI:
         watcher = asyncio.create_task(
             watch_agents_dir(settings.agents_dir, registry, stop_event=stop)
         )
-        # Drain the durable Postgres job queue if any handlers are registered
-        # (currently: wiki refresh). Falls back to in-memory mode when the DB
-        # isn't reachable; either way the queue is bounded.
+        # Drain the durable Postgres job queue. The runtime.chain.advance
+        # handler is always registered now (durable chains), so this loop
+        # is always live; wiki refresh, signal scans, etc. share the same
+        # worker. Falls back to in-memory mode when the DB isn't reachable.
         worker = None
         if job_handlers:
             worker = asyncio.create_task(
                 _run_worker(job_queue, job_handlers, stop_event=stop)
             )
+
+        # Periodic cleanup so durable tables don't grow unbounded.
+        # idempotency expires by row TTL; jobs done/failed past
+        # `jobs_retention_days` are removed wholesale.
+        async def _cleanup_loop() -> None:
+            interval = float(settings.cleanup_interval_seconds)
+            try:
+                while not stop.is_set():
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=interval)
+                        return  # stop event fired
+                    except TimeoutError:
+                        pass
+                    try:
+                        idem_cache.cleanup()
+                    except Exception as exc:
+                        log.warning("cleanup.idem_failed", error=str(exc))
+                    try:
+                        job_queue.cleanup(retention_days=settings.jobs_retention_days)
+                    except Exception as exc:
+                        log.warning("cleanup.jobs_failed", error=str(exc))
+            except asyncio.CancelledError:
+                return
+
+        cleaner = asyncio.create_task(_cleanup_loop())
         try:
             yield
         finally:
@@ -235,6 +261,7 @@ def build_app() -> FastAPI:
             watcher.cancel()
             if worker is not None:
                 worker.cancel()
+            cleaner.cancel()
 
     app = FastAPI(title="agent-core-orchestrator", lifespan=lifespan)
 

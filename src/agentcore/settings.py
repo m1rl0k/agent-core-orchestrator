@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # loops without clamping per-call throughput. Set 0 to disable.
     max_chain_seconds: int = Field(1800, alias="AGENTCORE_MAX_CHAIN_SECONDS")
 
+    # Periodic cleanup of expired idempotency rows + done/failed jobs past
+    # the retention window. Idempotency rows already self-expire via TTL on
+    # read; this is the bulk cleanup that keeps the table bounded.
+    cleanup_interval_seconds: int = Field(900, alias="AGENTCORE_CLEANUP_INTERVAL_SECONDS")
+    jobs_retention_days: int = Field(7, alias="AGENTCORE_JOBS_RETENTION_DAYS")
+
     # Provider priority — comma-separated list. The orchestrator picks the first
     # provider in this list whose credentials are populated when an agent's
     # declared provider is not configured. z.ai is preferred by default; flip
