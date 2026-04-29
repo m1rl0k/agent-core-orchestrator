@@ -599,25 +599,59 @@ class Runtime:
         handoff: Handoff,
         bad: list[dict[str, str]],
     ) -> dict[str, Any]:
-        """Re-ask the agent after one or more diffs failed to apply.
+        """Re-ask the agent after one or more edits failed to apply.
 
-        Hands back the exact `git apply --check` error per file so the
-        model can correct context anchors / file headers / line numbers
-        instead of guessing what went wrong.
+        Hands back the exact validation error per file. For `edit`
+        ops whose `old` text wasn't found in the file, also attaches
+        the file's literal current content so the dev can see what's
+        really there instead of guessing — that's the single biggest
+        cause of "patch doesn't apply" loops.
         """
+        import os
+
         messages = await self._render_messages(spec, handoff)
+        repo = Path(os.environ.get("AGENTCORE_REPO_ROOT", ".")).resolve()
+
+        # Attach literal current contents of any file the dev tried to
+        # edit unsuccessfully — so it can see EXACTLY what's there.
+        contents_block: list[str] = []
+        seen_paths: set[str] = set()
+        for b in bad[:10]:
+            path = b.get("path", "")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            target = (repo / path).resolve() if path else repo
+            try:
+                target.relative_to(repo)
+            except ValueError:
+                continue
+            if not target.exists() or not target.is_file():
+                continue
+            try:
+                body = target.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # Cap each file at ~6000 chars in the nudge so prompt
+            # stays reasonable; agents on huge files get a head + tail.
+            if len(body) > 6000:
+                body = body[:3000] + "\n…[truncated]…\n" + body[-3000:]
+            contents_block.append(
+                f"\n=== ACTUAL CONTENT of {path} ===\n```\n{body}\n```"
+            )
+
         bullets = "\n".join(
             f"  - {b['path']}: {b['error']}" for b in bad[:10]
         )
         nudge = (
-            "Your previous response had diffs that FAIL `git apply --check`. "
-            "Errors below — fix the unified-diff syntax (preserve `def` / "
-            "header lines as context, correct hunk line numbers, ensure "
-            "`--- /dev/null` for new files, exact `--- a/path` / `+++ b/path` "
-            "headers, no trailing whitespace). Re-emit the JSON with corrected "
-            "diffs.\n\n"
-            f"{bullets}\n\n"
-            "Reply ONLY with the corrected JSON object."
+            "Your previous response had edits that FAIL validation. "
+            "Errors below — fix and re-emit the JSON.\n\n"
+            f"{bullets}\n"
+            f"{''.join(contents_block)}\n\n"
+            "For `edit` ops, copy `old` LITERALLY from the actual "
+            "content above (every space, tab, and newline must match). "
+            "If a file you tried to `edit` doesn't exist, switch the "
+            "action to `create`. Reply ONLY with the corrected JSON object."
         )
         messages = [*messages, ChatMessage(role="user", content=nudge)]
         try:
@@ -857,6 +891,28 @@ class Runtime:
                     start=start, end=end, content=hunk,
                     intent=intent, role=spec.name,
                 )
+
+        # ---- Snippets from structured file_ops (preferred shape) -------
+        # FileOps don't carry line ranges, but we still want each touch
+        # to land in the graph so dashboard / UI / retrieval can find
+        # the dev's actual emitted output. We record one snippet per
+        # op carrying the new content (or `new` for edits).
+        for op in output.get("file_ops", []) or []:
+            if not isinstance(op, dict) or not op.get("path"):
+                continue
+            path = op["path"]
+            self.graph.record_change(handoff.task_id, path, created_by=spec.name)
+            content = op.get("content") or op.get("new") or ""
+            if not content and op.get("action") in ("create", "replace", "edit"):
+                # Even an empty-content op deserves a marker so we can
+                # see the chain touched the file.
+                content = f"<{op.get('action','?')} {path}>"
+            line_count = max(1, len(content.splitlines()))
+            self.graph.record_snippet(
+                handoff.task_id, path,
+                start=1, end=line_count, content=content,
+                intent=op.get("rationale") or intent, role=spec.name,
+            )
 
         # ---- Agent-supplied snippet/feedback annotations ----------------
         # Agents may include `_snippets` or `_feedback` to enrich beyond what

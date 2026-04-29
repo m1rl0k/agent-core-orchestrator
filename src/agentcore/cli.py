@@ -859,7 +859,16 @@ async def _run_review_round(
         default=str,
     )[:8000]
 
-    review_roles = [r for r in ("architect", "developer", "qa", "ops") if registry.get(r)]
+    # Exclude the producer of the artifact under review. The chain's
+    # primary artifact is the developer's patch; developer voting on
+    # its own patch is a logical contradiction — if it knew the patch
+    # was broken, it wouldn't have produced it. The reviewer panel is
+    # its peers: architect (plan-level), qa (tests), ops (ship).
+    producer = "developer" if state.get("developer_output") else None
+    review_roles = [
+        r for r in ("architect", "developer", "qa", "ops")
+        if registry.get(r) and r != producer
+    ]
     verdicts: list[dict] = []
     for role in review_roles:
         spec = registry.get(role)
