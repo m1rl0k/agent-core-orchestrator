@@ -29,15 +29,18 @@ log = structlog.get_logger(__name__)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS agentcore_idempotency (
+  project_id  TEXT NOT NULL DEFAULT 'default',
   key         TEXT NOT NULL,
   scope       TEXT NOT NULL,
   payload     JSONB NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at  TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (scope, key)
+  PRIMARY KEY (project_id, scope, key)
 );
 CREATE INDEX IF NOT EXISTS idx_idem_expires
   ON agentcore_idempotency(expires_at);
+CREATE INDEX IF NOT EXISTS idx_agentcore_idempotency_project
+  ON agentcore_idempotency(project_id);
 """
 
 
@@ -49,8 +52,9 @@ class _MemEntry:
 
 @dataclass(slots=True)
 class IdempotencyStore:
-    """`(scope, key) -> response` cache with TTL.
+    """`(project_id, scope, key) -> response` cache with TTL.
 
+    Multi-tenant safe — same key under different projects is distinct.
     Tries Postgres first; falls back to a bounded in-memory dict if the DB
     is unavailable. Both code paths are safe to call concurrently from
     asyncio handlers (Postgres path: row-level via PRIMARY KEY + ON
@@ -59,7 +63,7 @@ class IdempotencyStore:
 
     settings: Settings = field(default_factory=get_settings)
     ttl_seconds: float = 86400.0
-    _mem: dict[tuple[str, str], _MemEntry] = field(default_factory=dict)
+    _mem: dict[tuple[str, str, str], _MemEntry] = field(default_factory=dict)
     _mem_max: int = 4096
     _persistent: bool = field(default=False, init=False)
 
@@ -77,12 +81,15 @@ class IdempotencyStore:
 
     # ---- public API -------------------------------------------------
 
-    def get(self, scope: str, key: str) -> dict[str, Any] | None:
+    def get(
+        self, scope: str, key: str, *, project_id: str | None = None
+    ) -> dict[str, Any] | None:
+        pid = project_id or self.settings.project_name
         if self._persistent:
             with contextlib.suppress(Exception):
-                return self._get_pg(scope, key)
+                return self._get_pg(pid, scope, key)
             # Fall through to memory if a live read fails (DB blip).
-        return self._get_mem(scope, key)
+        return self._get_mem(pid, scope, key)
 
     def put(
         self,
@@ -90,14 +97,16 @@ class IdempotencyStore:
         key: str,
         payload: dict[str, Any],
         *,
+        project_id: str | None = None,
         ttl_seconds: float | None = None,
     ) -> None:
+        pid = project_id or self.settings.project_name
         ttl = float(ttl_seconds if ttl_seconds is not None else self.ttl_seconds)
         if self._persistent:
             with contextlib.suppress(Exception):
-                self._put_pg(scope, key, payload, ttl)
+                self._put_pg(pid, scope, key, payload, ttl)
                 return
-        self._put_mem(scope, key, payload, ttl)
+        self._put_mem(pid, scope, key, payload, ttl)
 
     def cleanup(self) -> int:
         """Delete expired rows. Cheap — index on expires_at."""
@@ -119,15 +128,15 @@ class IdempotencyStore:
 
     # ---- Postgres path ----------------------------------------------
 
-    def _get_pg(self, scope: str, key: str) -> dict[str, Any] | None:
+    def _get_pg(self, pid: str, scope: str, key: str) -> dict[str, Any] | None:
         with (
             psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(
                 "SELECT payload FROM agentcore_idempotency "
-                "WHERE scope = %s AND key = %s AND expires_at > now()",
-                (scope, key),
+                "WHERE project_id = %s AND scope = %s AND key = %s AND expires_at > now()",
+                (pid, scope, key),
             )
             row = cur.fetchone()
             if row is None:
@@ -136,7 +145,7 @@ class IdempotencyStore:
             return payload if isinstance(payload, dict) else None
 
     def _put_pg(
-        self, scope: str, key: str, payload: dict[str, Any], ttl: float
+        self, pid: str, scope: str, key: str, payload: dict[str, Any], ttl: float
     ) -> None:
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         with (
@@ -145,29 +154,30 @@ class IdempotencyStore:
         ):
             cur.execute(
                 """
-                INSERT INTO agentcore_idempotency (scope, key, payload, expires_at)
-                VALUES (%s, %s, %s::jsonb, %s)
-                ON CONFLICT (scope, key) DO UPDATE SET
+                INSERT INTO agentcore_idempotency
+                  (project_id, scope, key, payload, expires_at)
+                VALUES (%s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (project_id, scope, key) DO UPDATE SET
                   payload = EXCLUDED.payload,
                   expires_at = EXCLUDED.expires_at
                 """,
-                (scope, key, json.dumps(payload), expires_at),
+                (pid, scope, key, json.dumps(payload), expires_at),
             )
 
     # ---- in-memory fallback -----------------------------------------
 
-    def _get_mem(self, scope: str, key: str) -> dict[str, Any] | None:
+    def _get_mem(self, pid: str, scope: str, key: str) -> dict[str, Any] | None:
         now = time.monotonic()
-        entry = self._mem.get((scope, key))
+        entry = self._mem.get((pid, scope, key))
         if entry is None:
             return None
         if entry.expires_at < now:
-            self._mem.pop((scope, key), None)
+            self._mem.pop((pid, scope, key), None)
             return None
         return entry.payload
 
     def _put_mem(
-        self, scope: str, key: str, payload: dict[str, Any], ttl: float
+        self, pid: str, scope: str, key: str, payload: dict[str, Any], ttl: float
     ) -> None:
         if len(self._mem) >= self._mem_max:
             self._cleanup_mem()
@@ -175,7 +185,7 @@ class IdempotencyStore:
                 # Drop the oldest by expiry.
                 oldest = min(self._mem.items(), key=lambda kv: kv[1].expires_at)[0]
                 self._mem.pop(oldest, None)
-        self._mem[(scope, key)] = _MemEntry(
+        self._mem[(pid, scope, key)] = _MemEntry(
             payload=payload, expires_at=time.monotonic() + ttl
         )
 
