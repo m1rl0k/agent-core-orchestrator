@@ -41,6 +41,12 @@ dependencies = [
   "networkx>=3.2",
   "python-louvain>=0.16",
 
+  # Schema migrations for the durable Postgres state (chunks, graph,
+  # idempotency, jobs). Inline `CREATE TABLE IF NOT EXISTS` calls in
+  # init_schema() remain as a dev-mode fallback; production should run
+  # `alembic upgrade head` once on deploy.
+  "alembic>=1.13",
+
   # First-class code-graph: graphify (in-process Python).
   # NetworkX + Leiden + tree-sitter; same stack family we already use, so
   # graphs compose without serialization. graphify owns its own tree-sitter
@@ -66,6 +72,12 @@ agentcore = "agentcore.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentcore"]
+# Ship the alembic config + migrations alongside the package so a `pip
+# install agentcore` user can run `agentcore migrate upgrade head` without
+# cloning the repo.
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "agentcore/_alembic/alembic.ini"
+"migrations" = "agentcore/_alembic/migrations"
 
 [tool.ruff]
 line-length = 100

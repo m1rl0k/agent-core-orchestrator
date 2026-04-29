@@ -175,7 +175,9 @@ class Runtime:
             classify_change_kinds,
         )
 
-        self.graph.record_handoff(handoff.task_id, handoff.from_agent, spec.name)
+        self.graph.record_handoff(
+            handoff.task_id, handoff.from_agent, spec.name, created_by=spec.name
+        )
 
         intent = (
             output.get("plan_summary")
@@ -188,7 +190,7 @@ class Runtime:
         for fc in output.get("files_to_change", []) or []:
             if not isinstance(fc, dict) or "path" not in fc:
                 continue
-            self.graph.record_change(handoff.task_id, fc["path"])
+            self.graph.record_change(handoff.task_id, fc["path"], created_by=spec.name)
             self.graph.record_snippet(
                 handoff.task_id,
                 fc["path"],
@@ -197,6 +199,7 @@ class Runtime:
                 content=str(fc.get("rationale", "")),
                 intent=intent,
                 role=spec.name,
+                created_by=spec.name,
             )
 
         # ---- Snippets from developer/qa diffs (line-range level) --------
@@ -204,7 +207,7 @@ class Runtime:
             if not isinstance(diff, dict) or "path" not in diff:
                 continue
             path = diff["path"]
-            self.graph.record_change(handoff.task_id, path)
+            self.graph.record_change(handoff.task_id, path, created_by=spec.name)
             for start, end, hunk in self._parse_diff_hunks(str(diff.get("unified_diff", ""))):
                 self.graph.record_snippet(
                     handoff.task_id, path,
@@ -226,6 +229,7 @@ class Runtime:
                 content=str(snip.get("content", "")),
                 intent=str(snip.get("intent", intent)),
                 role=spec.name,
+                created_by=spec.name,
             )
         for fb in output.pop("_feedback", []) or []:
             if not isinstance(fb, dict) or "label" not in fb:
@@ -235,11 +239,14 @@ class Runtime:
                 str(fb["label"]),
                 score=float(fb.get("score", 1.0)),
                 reason=str(fb.get("reason", "")),
+                created_by=spec.name,
             )
 
         # ---- Auto-classification (change-kind labels) -------------------
         for kind in classify_change_kinds(intent):
-            self.graph.tag_relevance(handoff.task_id, kind, reason="auto-classified")
+            self.graph.tag_relevance(
+                handoff.task_id, kind, reason="auto-classified", created_by=spec.name
+            )
 
         # ---- Graphify enrichment + blast-radius PRF ---------------------
         paths = self._extract_paths(output)
@@ -251,7 +258,9 @@ class Runtime:
             impact = self.graphify.impact(path)
             if impact is None:
                 continue
-            self.graph.record_impact(handoff.task_id, path, impact.downstream)
+            self.graph.record_impact(
+                handoff.task_id, path, impact.downstream, created_by=spec.name
+            )
             total_downstream += len(impact.downstream)
             sub = self.graphify.subgraph_for([impact.symbol, *impact.downstream])
             if sub is not None:
@@ -263,6 +272,7 @@ class Runtime:
                 handoff.task_id, label,
                 score=float(total_downstream),
                 reason=f"{total_downstream} downstream symbols",
+                created_by=spec.name,
             )
 
     @staticmethod

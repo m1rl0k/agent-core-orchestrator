@@ -1,0 +1,59 @@
+{
+  "name": "agent-core-orchestrator",
+  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.devcontainer.yml"],
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.13"
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -e .[dev]",
+  "postStartCommand": "agentcore doctor || true",
+
+  "forwardPorts": [8088, 5432],
+  "portsAttributes": {
+    "8088": { "label": "agentcore orchestrator", "onAutoForward": "notify" },
+    "5432": { "label": "postgres + pgvector",  "onAutoForward": "silent" }
+  },
+
+  "remoteEnv": {
+    "PGHOST": "postgres",
+    "PGUSER": "agentcore",
+    "PGPASSWORD": "agentcore",
+    "PGDATABASE": "agentcore",
+    "AGENTCORE_HOST": "0.0.0.0",
+    "AGENTCORE_API_TOKEN": "devcontainer",
+    "AGENTCORE_AGENTS_DIR": "/workspace/agents",
+    "AGENTCORE_GRAPHIFY_REPO_ROOT": "/workspace",
+    "AGENTCORE_PROJECT_NAME": "agentcore",
+    "FASTEMBED_CACHE_DIR": "/cache/fastembed"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "tamasfe.even-better-toml",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"],
+        "[python]": {
+          "editor.formatOnSave": true,
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.codeActionsOnSave": { "source.organizeImports": "explicit" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# Extends the project's top-level docker-compose.yml with a `devcontainer`
+# service so VS Code (or any Dev Containers-aware client) gets a clean
+# Python 3.13 sandbox wired to the existing postgres/pgvector service.
+#
+# `docker compose up postgres devcontainer` is enough to drive integration
+# tests outside VS Code.
+
+services:
+  devcontainer:
+    image: mcr.microsoft.com/devcontainers/python:3.13
+    volumes:
+      - ..:/workspace:cached
+      - fastembed-cache:/cache/fastembed
+    command: sleep infinity
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: agentcore
+      PGPASSWORD: agentcore
+      PGDATABASE: agentcore
+      FASTEMBED_CACHE_DIR: /cache/fastembed
+
+volumes:
+  fastembed-cache:

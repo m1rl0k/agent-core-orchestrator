@@ -376,6 +376,52 @@ def link_claude(
 
 
 # ---------------------------------------------------------------------------
+# migrate — Alembic wrapper for the durable Postgres schema
+# ---------------------------------------------------------------------------
+
+
+migrate_app = typer.Typer(help="Apply / inspect schema migrations")
+app.add_typer(migrate_app, name="migrate")
+
+
+def _alembic_main(args: list[str]) -> int:
+    """Invoke alembic in-process so we don't shell out to a separate binary."""
+    from alembic.config import main as _alembic_run
+
+    repo = Path(__file__).resolve().parent.parent.parent
+    cfg_path = str(repo / "alembic.ini")
+    return int(_alembic_run(argv=["-c", cfg_path, *args]) or 0)
+
+
+@migrate_app.command("upgrade")
+def migrate_upgrade(
+    revision: str = typer.Argument("head", help="Target revision (default: head)"),
+) -> None:
+    """Apply all pending migrations up to <revision>. Idempotent."""
+    raise typer.Exit(code=_alembic_main(["upgrade", revision]))
+
+
+@migrate_app.command("downgrade")
+def migrate_downgrade(
+    revision: str = typer.Argument("-1", help="Target revision (default: previous)"),
+) -> None:
+    """Roll back to <revision>. Use cautiously."""
+    raise typer.Exit(code=_alembic_main(["downgrade", revision]))
+
+
+@migrate_app.command("current")
+def migrate_current() -> None:
+    """Print the database's current revision."""
+    raise typer.Exit(code=_alembic_main(["current"]))
+
+
+@migrate_app.command("history")
+def migrate_history() -> None:
+    """List the migration history."""
+    raise typer.Exit(code=_alembic_main(["history"]))
+
+
+# ---------------------------------------------------------------------------
 # wiki — living codebase wiki (curated by the wikist agent, indexed in pgvector)
 # ---------------------------------------------------------------------------
 
