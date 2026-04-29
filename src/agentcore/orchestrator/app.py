@@ -198,6 +198,39 @@ async def _runtime_chain_advance(
         ttl_seconds=86400.0,
     )
 
+    # Living-wiki maintenance — when the chain ended cleanly and we have
+    # touched files (from developer's file_ops or diffs), enqueue an
+    # incremental refresh. The wiki worker (registered in build_app)
+    # drains it asynchronously so the chain handler stays fast.
+    # Best-effort and idempotent (idempotency_key collapses duplicates).
+    if settings.enable_wiki:
+        import contextlib as _ctx
+        with _ctx.suppress(Exception):
+            touched: set[str] = set()
+            qa_failed = False
+            for hop in hops_so_far:
+                out = hop.get("output") or {}
+                if hop.get("agent") == "qa" and out.get("failed"):
+                    qa_failed = True
+                for op in out.get("file_ops") or []:
+                    if isinstance(op, dict) and op.get("path"):
+                        touched.add(str(op["path"]))
+                for d in out.get("diffs") or []:
+                    if isinstance(d, dict) and d.get("path"):
+                        touched.add(str(d["path"]))
+            if touched and not qa_failed:
+                job_queue.enqueue(
+                    "wiki.refresh.incremental",
+                    {
+                        "changed_paths": sorted(touched),
+                        "project_id": pid,
+                        "source_task_id": chain_id,
+                    },
+                    project_id=pid,
+                    idempotency_key=f"chain:{chain_id}",
+                    created_by=f"chain:{chain_id}",
+                )
+
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -789,7 +822,9 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
             embedder = Embedder(settings)
     index = WikiIndex(storage, embedder, vector)
     curator = WikiCurator(
-        router, storage, index, curator_model=settings.wiki_curator_model
+        router, storage, index,
+        curator_model=settings.wiki_curator_model,
+        curator_provider=settings.wiki_curator_provider,
     )
 
     # Register job handlers so the worker loop can drain wiki refresh jobs.

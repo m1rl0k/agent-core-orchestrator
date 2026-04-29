@@ -38,8 +38,8 @@ from agentcore.wiki.storage import WikiPage, WikiStorage
 log = structlog.get_logger(__name__)
 
 _DEFAULT_GLOB = "**/*.py"
-_MAX_BODY_PER_FILE = 6000  # chars piped into the prompt per file
-_MAX_FILES_PER_MODULE = 30
+_MAX_BODY_PER_FILE = 18000  # chars piped into the prompt per file
+_MAX_FILES_PER_MODULE = 100
 
 
 @dataclass(slots=True)
@@ -238,13 +238,19 @@ class WikiCurator:
         try:
             resp = await self.router.complete(
                 [ChatMessage(role="user", content=prompt)],
-                self._curator_cfg(max_tokens=1200),
+                self._curator_cfg(max_tokens=32000),
             )
         except Exception as exc:
             log.warning("wiki.module_render_failed", module=module, error=str(exc))
             return None
         body = resp.text.strip()
         if not body:
+            log.warning(
+                "wiki.module_render_empty",
+                module=module,
+                resp_len=len(resp.text or ""),
+                resp_head=(resp.text or "")[:200],
+            )
             return None
         return WikiPage(
             rel=f"modules/{module}.md",
@@ -278,7 +284,7 @@ class WikiCurator:
         try:
             resp = await self.router.complete(
                 [ChatMessage(role="user", content=prompt)],
-                self._curator_cfg(max_tokens=1200),
+                self._curator_cfg(max_tokens=32000),
             )
         except Exception as exc:
             log.warning("wiki.revise_failed", rel=page.rel, error=str(exc))

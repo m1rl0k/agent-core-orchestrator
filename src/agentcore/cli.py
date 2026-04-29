@@ -1788,6 +1788,7 @@ def _build_wiki_stack(settings, repo_root: Path):  # type: ignore[no-untyped-def
         storage,
         index,
         curator_model=settings.wiki_curator_model,
+        curator_provider=settings.wiki_curator_provider,
     )
     return storage, index, curator
 

@@ -242,7 +242,12 @@ class Settings(BaseSettings):
     # Model the curator uses for ingest + lint. Cheap + fast is the right
     # call here since this is high-volume and the agent has well-defined
     # output shape.
-    wiki_curator_model: str = Field("glm-4.6", alias="AGENTCORE_WIKI_CURATOR_MODEL")
+    wiki_curator_model: str = Field(
+        "moonshot.kimi-k2-thinking", alias="AGENTCORE_WIKI_CURATOR_MODEL"
+    )
+    wiki_curator_provider: str = Field(
+        "bedrock", alias="AGENTCORE_WIKI_CURATOR_PROVIDER"
+    )
     wiki_max_changed_paths: int = Field(200, alias="AGENTCORE_WIKI_MAX_CHANGED_PATHS")
 
 
