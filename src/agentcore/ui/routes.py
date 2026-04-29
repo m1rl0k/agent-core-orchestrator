@@ -190,15 +190,12 @@ def mount_ui(  # type: ignore[no-untyped-def]
     @app.get("/ui/chains/{chain_id}", response_class=HTMLResponse, name="ui-chain-detail")
     async def ui_chain_detail(request: Request, chain_id: str) -> HTMLResponse:
         pid = _pid(request)
-        # First source: idempotency cache (HTTP-driven chains carry full
-        # hop arrays here). Fall back to reconstruction from the graph
-        # so CLI-driven chains (which never touch the idempotency cache)
-        # still render a useful detail view.
-        chain = idem_cache.get("chain", chain_id, project_id=pid)
-        if chain is None:
-            chain = _chain_detail_from_graph(settings, chain_id, pid)
-        in_flight = _chain_in_flight_jobs(job_queue, chain_id, project_id=pid)
-        review_history = _chain_review_history(chain_id)
+        detail = _cached(
+            (pid, f"chain_detail:{chain_id}"),
+            lambda: _load_chain_detail(
+                settings, job_queue, idem_cache, chain_id, project_id=pid
+            ),
+        )
         return _TEMPLATES.TemplateResponse(
             request,
             "chain_detail.html",
@@ -206,9 +203,9 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 request,
                 "chains",
                 chain_id=chain_id,
-                chain=chain,  # None if neither source has it
-                in_flight=in_flight,
-                review_history=review_history,
+                chain=detail["chain"],  # None if neither source has it
+                in_flight=detail["in_flight"],
+                review_history=detail["review_history"],
             ),
         )
 
@@ -240,11 +237,8 @@ def mount_ui(  # type: ignore[no-untyped-def]
         dead_letter = []
         with contextlib.suppress(Exception):
             dead_letter = job_queue.list_dead_letter(project_id=pid, limit=20)
-        counts = {
-            "queued": sum(1 for j in jobs if j["status"] == "queued"),
-            "running": sum(1 for j in jobs if j["status"] == "running"),
-            "dead_letter": len(dead_letter),
-        }
+        counts = _job_counts(job_queue, pid)
+        counts["dead_letter"] = max(counts.get("dead_letter", 0), len(dead_letter))
         return _TEMPLATES.TemplateResponse(
             request,
             "jobs.html",
@@ -427,15 +421,74 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
     return int(row[0] or 0) if row else 0
 
 
-def _chain_review_history(chain_id: str) -> list[dict[str, Any]]:
-    """Extract review-round verdicts and route-backs from the local
-    JSONL trace at ~/.agentcore/traces/<chain-id>.jsonl. Lets the UI
-    show WHY a chain stalled or got rejected — not just that it did.
+def _load_chain_detail(  # type: ignore[no-untyped-def]
+    settings, job_queue, idem_cache, chain_id: str, *, project_id: str
+) -> dict[str, Any]:
+    """Load chain detail once for the UI TTL cache."""
+    # First source: idempotency cache (HTTP-driven chains carry full
+    # hop arrays here). Fall back to reconstruction from the graph
+    # so CLI-driven chains (which never touch the idempotency cache)
+    # still render a useful detail view.
+    chain = idem_cache.get("chain", chain_id, project_id=project_id)
+    if chain is None:
+        chain = _chain_detail_from_graph(settings, chain_id, project_id)
+    return {
+        "chain": chain,
+        "in_flight": _chain_in_flight_jobs(job_queue, chain_id, project_id=project_id),
+        "review_history": _chain_review_history(settings, chain_id, project_id),
+    }
 
-    Returns a list of `{round, agent, approved, comments, blockers,
-    route_back_to}` entries per verdict, plus synthetic entries for
-    `route_back` / `result` events.
+
+def _chain_review_history(
+    settings, chain_id: str, project_id: str  # type: ignore[no-untyped-def]
+) -> list[dict[str, Any]]:
+    """Extract review-round verdicts and route-backs from durable traces.
+
+    Postgres is preferred so multi-node orchestrators share review history.
+    The local JSONL trace remains a fallback for disk-only CLI workflows.
     """
+    out = _chain_review_history_pg(settings, chain_id, project_id)
+    if out:
+        return out
+    return _chain_review_history_jsonl(chain_id)
+
+
+def _chain_review_history_pg(
+    settings, chain_id: str, project_id: str  # type: ignore[no-untyped-def]
+) -> list[dict[str, Any]]:
+    import psycopg
+
+    kinds = ("verdict", "route_back", "result", "review_round")
+    sql = """
+    SELECT step, kind, actor, at, detail
+      FROM agentcore_traces
+     WHERE project_id = %s
+       AND task_id = %s
+       AND kind = ANY(%s)
+  ORDER BY at ASC, id ASC
+    """
+    try:
+        with (
+            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute(sql, (project_id, chain_id, list(kinds)))
+            rows = cur.fetchall() or []
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for step, kind, actor, at, detail in rows:
+        out.append({
+            "kind": str(kind),
+            "round": step,
+            "actor": actor,
+            "at": at.isoformat() if hasattr(at, "isoformat") else at,
+            **(detail if isinstance(detail, dict) else {}),
+        })
+    return out
+
+
+def _chain_review_history_jsonl(chain_id: str) -> list[dict[str, Any]]:
     from pathlib import Path as _P
 
     path = _P.home() / ".agentcore" / "traces" / f"{chain_id}.jsonl"
@@ -722,6 +775,9 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
     out = {
         "queued": 0,
         "running": 0,
+        "done": 0,
+        "failed": 0,
+        "cancelled": 0,
         "dead_letter": 0,
         "chain_running": 0,
         "chain_24h": 0,
@@ -732,6 +788,9 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
     SELECT
       count(*) FILTER (WHERE status = 'queued')                             AS queued,
       count(*) FILTER (WHERE status = 'running')                            AS running,
+      count(*) FILTER (WHERE status = 'done')                               AS done,
+      count(*) FILTER (WHERE status = 'failed')                             AS failed,
+      count(*) FILTER (WHERE status = 'cancelled')                          AS cancelled,
       count(*) FILTER (WHERE status = 'dead_letter')                        AS dead_letter,
       count(*) FILTER (WHERE kind = 'runtime.chain.advance'
                          AND status IN ('queued','running'))                AS chain_running,
@@ -749,9 +808,12 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
     if row:
         out["queued"] = int(row[0] or 0)
         out["running"] = int(row[1] or 0)
-        out["dead_letter"] = int(row[2] or 0)
-        out["chain_running"] = int(row[3] or 0)
-        out["chain_24h"] = int(row[4] or 0)
+        out["done"] = int(row[2] or 0)
+        out["failed"] = int(row[3] or 0)
+        out["cancelled"] = int(row[4] or 0)
+        out["dead_letter"] = int(row[5] or 0)
+        out["chain_running"] = int(row[6] or 0)
+        out["chain_24h"] = int(row[7] or 0)
     return out
 
 

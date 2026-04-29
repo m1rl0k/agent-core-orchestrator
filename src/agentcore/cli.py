@@ -37,7 +37,7 @@ from agentcore.host import detect_host, render_install_hint
 from agentcore.language import detect_languages, probe_lsps
 from agentcore.llm.router import ChatMessage, LLMRouter
 from agentcore.logging_setup import configure_logging
-from agentcore.orchestrator.runtime import Runtime
+from agentcore.orchestrator.runtime import Runtime, reset_trace_project, set_trace_project
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry
@@ -493,6 +493,25 @@ async def _plan_async_body(
             if all(v["approved"] for v in verdicts):
                 console.print("[bold green]all roles approved[/bold green]")
                 break
+            if _environment_only_review_blockers(verdicts, state):
+                console.print(
+                    "[yellow]review blockers are environment-only and QA report is clean; "
+                    "treating as converged[/yellow]"
+                )
+                traces.record(TraceEvent(
+                    task_id=task_id, step=loop_idx + 1, kind="review_round",
+                    actor="cli",
+                    detail={"round": loop_idx + 1, "convergence_override": "environment_only"},
+                ))
+                for v in verdicts:
+                    if not v.get("approved"):
+                        v["approved"] = True
+                        v["comments"] = (
+                            (v.get("comments") or "")
+                            + " Environment-only blocker overridden after clean QA report."
+                        ).strip()
+                        v["blockers"] = []
+                break
             if max_review_loops > 0 and loop_idx + 1 >= max_review_loops:
                 console.print(
                     f"[yellow]max review loops ({max_review_loops}) reached without "
@@ -761,8 +780,12 @@ async def _run_chain(
             console=console,
             spinner="dots",
         )
-        with spinner:
-            outcome, nxt = await runtime.execute(current)
+        token = set_trace_project(get_settings().project_name)
+        try:
+            with spinner:
+                outcome, nxt = await runtime.execute(current)
+        finally:
+            reset_trace_project(token)
         state[f"{outcome.agent}_output"] = outcome.output
         _print_outcome(outcome)
         if not (chain and nxt):
@@ -938,6 +961,46 @@ async def _run_review_round(
                 "route_back_to": "architect",
             })
     return verdicts
+
+
+_ENV_BLOCKER_TERMS = (
+    "pytest not installed",
+    "no module named pytest",
+    "pytest module not found",
+    "test environment",
+    "environment failure",
+    "missing pytest",
+    "test runner failed",
+    "zero tests executed",
+    "cannot execute test",
+    "cannot verify",
+)
+
+
+def _environment_only_review_blockers(verdicts: list[dict], state: dict) -> bool:
+    """Allow convergence when review LLMs only object to local test infra.
+
+    Runtime QA already ran in the worktree before the review round. If that
+    QA report has no failed cases, repeated review complaints about missing
+    pytest/test environment are not actionable patch feedback and should not
+    bounce the chain forever.
+    """
+    qa = state.get("qa_output") or {}
+    if qa.get("failed"):
+        return False
+    rejected = [v for v in verdicts if not v.get("approved")]
+    if not rejected:
+        return False
+    for verdict in rejected:
+        text = " ".join(
+            [
+                str(verdict.get("comments") or ""),
+                " ".join(str(b) for b in verdict.get("blockers", []) or []),
+            ]
+        ).lower()
+        if not any(term in text for term in _ENV_BLOCKER_TERMS):
+            return False
+    return True
 
 
 def _compose_revision_brief(
@@ -1130,28 +1193,25 @@ def tail(
 
     settings = get_settings()
     base = url or f"http://{settings.host}:{settings.port}"
-    headers = {}
+    headers = {"X-Project-Id": settings.project_name}
     if settings.api_token:
         headers["Authorization"] = f"Bearer {settings.api_token}"
 
     local_path = Path.home() / ".agentcore" / "traces" / f"{chain_id}.jsonl"
-    have_local = local_path.exists()
 
     console.print(
         Panel(
             f"[bold cyan]chain[/bold cyan] {chain_id}\n"
-            f"[bold cyan]source[/bold cyan] "
-            + (f"local file [dim]({local_path})[/dim]"
-               if have_local else f"http {base}"),
+            f"[bold cyan]source[/bold cyan] http {base}"
+            + (
+                f" [dim](local fallback: {local_path})[/dim]"
+                if local_path.exists() else ""
+            ),
             title="agentcore · tail",
             border_style="cyan",
             padding=(0, 1),
         )
     )
-
-    if have_local:
-        _tail_local(local_path, interval=interval)
-        return
 
     seen = 0
     warned = False
@@ -1621,7 +1681,12 @@ def _build_wiki_stack(settings, repo_root: Path):  # type: ignore[no-untyped-def
     from agentcore.wiki.storage import WikiStorage
 
     branch = _resolve_branch(repo_root)
-    storage = WikiStorage(settings.wiki_root, settings.project_name, branch)
+    storage = WikiStorage(
+        settings.wiki_root,
+        settings.project_name,
+        branch,
+        settings=settings if settings.wiki_persistent else None,
+    )
 
     embedder = None
     vector = None

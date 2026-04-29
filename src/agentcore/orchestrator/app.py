@@ -29,7 +29,13 @@ from agentcore.llm.router import LLMRouter
 from agentcore.logging_setup import configure_logging
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.runtime import Handoff as _H  # noqa: F401 - keep import shape
-from agentcore.orchestrator.runtime import HandoffRejected, Runtime, SLAExceeded
+from agentcore.orchestrator.runtime import (
+    HandoffRejected,
+    Runtime,
+    SLAExceeded,
+    reset_trace_project,
+    set_trace_project,
+)
 from agentcore.orchestrator.traces import TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry, watch_agents_dir
@@ -148,7 +154,7 @@ def build_app() -> FastAPI:
 
         handoff = Handoff(**payload["handoff"])
         try:
-            outcome, nxt = await runtime.execute(handoff)
+            outcome, nxt = await execute_for_project(handoff, pid)
         except (HandoffRejected, SLAExceeded) as exc:
             # Fatal for this chain — record final state and stop.
             idem_cache.put(
@@ -218,6 +224,15 @@ def build_app() -> FastAPI:
         except Exception:
             return
 
+    async def execute_for_project(
+        handoff: Handoff, project_id: str
+    ) -> tuple[Any, Handoff | None]:
+        token = set_trace_project(project_id)
+        try:
+            return await runtime.execute(handoff)
+        finally:
+            reset_trace_project(token)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         from agentcore.state.bootstrap import verify_schema
@@ -267,6 +282,10 @@ def build_app() -> FastAPI:
                         job_queue.cleanup(retention_days=settings.jobs_retention_days)
                     except Exception as exc:
                         log.warning("cleanup.jobs_failed", error=str(exc))
+                    try:
+                        traces.cleanup(retention_days=settings.trace_retention_days)
+                    except Exception as exc:
+                        log.warning("cleanup.traces_failed", error=str(exc))
             except asyncio.CancelledError:
                 return
 
@@ -285,9 +304,28 @@ def build_app() -> FastAPI:
 
     # Mount the lightweight Jinja UI at /ui. Read-only views over the
     # same state the HTTP API exposes — dashboard, agents, chains,
-    # jobs, wiki. Wiki tab only appears when AGENTCORE_ENABLE_WIKI=true.
+    # jobs, wiki. Build a UI wiki storage here because UI routes are
+    # registered before the API wiki endpoints below.
     try:
         from agentcore.ui import mount_ui
+
+        ui_wiki_storage = None
+        if settings.enable_wiki:
+            with contextlib.suppress(Exception):
+                from agentcore.adapters.git_local import GitAdapter
+                from agentcore.wiki.storage import WikiStorage
+
+                branch = "default"
+                with contextlib.suppress(Exception):
+                    b = GitAdapter(repo_root=settings.graphify_repo_root).current_branch()
+                    if b:
+                        branch = b
+                ui_wiki_storage = WikiStorage(
+                    settings.wiki_root,
+                    settings.project_name,
+                    branch,
+                    settings=settings if settings.wiki_persistent else None,
+                )
 
         mount_ui(
             app,
@@ -296,7 +334,7 @@ def build_app() -> FastAPI:
             job_queue=job_queue,
             idem_cache=idem_cache,
             host_info=detect_host(),
-            wiki_storage=None,  # populated by _register_wiki_routes when enabled
+            wiki_storage=ui_wiki_storage,
         )
     except Exception as exc:
         log.warning("ui.mount_failed", error=str(exc))
@@ -335,7 +373,7 @@ def build_app() -> FastAPI:
         return {name: cap.__dict__ for name, cap in detect_capabilities(settings).items()}
 
     async def _drive_chain(
-        first: Handoff, max_hops: int, chain: bool
+        first: Handoff, max_hops: int, chain: bool, project_id: str
     ) -> list[dict[str, Any]]:
         """Run the handoff chain. Wrapped by /run with `max_chain_seconds`."""
         hops: list[dict[str, Any]] = []
@@ -343,7 +381,7 @@ def build_app() -> FastAPI:
         for _ in range(max_hops):
             if current is None:
                 break
-            outcome, nxt = await runtime.execute(current)
+            outcome, nxt = await execute_for_project(current, project_id)
             hops.append({
                 "agent": outcome.agent,
                 "status": outcome.status,
@@ -407,11 +445,11 @@ def build_app() -> FastAPI:
         try:
             if chain_cap and chain_cap > 0:
                 hops = await asyncio.wait_for(
-                    _drive_chain(handoff, req.max_hops, req.chain),
+                    _drive_chain(handoff, req.max_hops, req.chain, pid),
                     timeout=float(chain_cap),
                 )
             else:
-                hops = await _drive_chain(handoff, req.max_hops, req.chain)
+                hops = await _drive_chain(handoff, req.max_hops, req.chain, pid)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SLAExceeded as exc:
@@ -452,7 +490,7 @@ def build_app() -> FastAPI:
             payload=req.payload,
         )
         try:
-            outcome, _ = await runtime.execute(handoff)
+            outcome, _ = await execute_for_project(handoff, pid)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SLAExceeded as exc:
@@ -494,7 +532,7 @@ def build_app() -> FastAPI:
             payload={"signal": sig.model_dump()},
         )
         try:
-            outcome, _ = await runtime.execute(handoff)
+            outcome, _ = await execute_for_project(handoff, pid)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SLAExceeded as exc:
@@ -622,10 +660,15 @@ def build_app() -> FastAPI:
         return {"job_id": job_id, "project_id": pid, "status": "queued"}
 
     @app.get("/tasks/{task_id}/trace")
-    async def trace(task_id: str) -> dict[str, Any]:
-        events = traces.for_task(task_id)
+    async def trace(
+        task_id: str,
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    ) -> dict[str, Any]:
+        pid = project_id or settings.project_name
+        events = traces.for_task(task_id, project_id=pid)
         return {
             "task_id": task_id,
+            "project_id": pid,
             "events": [
                 {
                     "step": e.step,
@@ -667,7 +710,12 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
         b = GitAdapter(repo_root=settings.graphify_repo_root).current_branch()
         if b:
             branch = b
-    storage = WikiStorage(settings.wiki_root, settings.project_name, branch)
+    storage = WikiStorage(
+        settings.wiki_root,
+        settings.project_name,
+        branch,
+        settings=settings if settings.wiki_persistent else None,
+    )
 
     embedder = None
     vector = None

@@ -1,4 +1,4 @@
-"""Filesystem layer for the wiki.
+"""Filesystem + optional Postgres layer for the wiki.
 
 `WikiStorage` is a small, deterministic IO module:
   - read / write / delete pages under `<root>/<project>/<branch>/...`
@@ -6,6 +6,10 @@
   - content-hash skip: writes are no-ops when the page hasn't actually changed
   - frontmatter merge: never silently drops `sources[]` or audit fields
   - walk: yields every WikiPage under the project/branch root
+
+When constructed with `settings`, pages are also mirrored to Postgres so
+multi-node orchestrators can serve the same wiki. Disk remains the local
+fallback and compatibility layer for Obsidian/vault workflows.
 
 The path layout is stable so other tooling (Claude Code skills mirror, web
 view, the Obsidian vault) can rely on it:
@@ -23,6 +27,7 @@ view, the Obsidian vault) can rely on it:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 from collections.abc import Iterator
@@ -33,6 +38,30 @@ from pathlib import Path
 from typing import Any
 
 import frontmatter
+import psycopg
+import structlog
+
+from agentcore.settings import Settings
+
+log = structlog.get_logger(__name__)
+
+DDL = """
+CREATE TABLE IF NOT EXISTS agentcore_wiki_pages (
+  project_id    TEXT NOT NULL,
+  branch        TEXT NOT NULL,
+  rel           TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  frontmatter   JSONB NOT NULL DEFAULT '{}'::jsonb,
+  body          TEXT NOT NULL DEFAULT '',
+  content_hash  TEXT NOT NULL DEFAULT '',
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, branch, rel)
+);
+CREATE INDEX IF NOT EXISTS idx_agentcore_wiki_pages_project_branch
+  ON agentcore_wiki_pages (project_id, branch);
+CREATE INDEX IF NOT EXISTS idx_agentcore_wiki_pages_updated
+  ON agentcore_wiki_pages (project_id, branch, updated_at DESC);
+"""
 
 
 def _utcnow_iso() -> str:
@@ -102,12 +131,40 @@ class WikiStorage:
         wiki_root: Path | str,
         project: str,
         branch: str,
+        *,
+        settings: Settings | None = None,
     ) -> None:
         self.wiki_root = Path(wiki_root)
         self.project = project
         self.branch = branch or "default"
+        self.settings = settings
+        self._persistent = False
         self.root = self.wiki_root / self.project / self.branch
         self._root_resolved = self.root.resolve()
+        if self.settings is not None:
+            self.init_schema()
+
+    def init_schema(self) -> bool:
+        if self.settings is None:
+            self._persistent = False
+            return False
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(DDL)
+            self._persistent = True
+            log.info("wiki.pages_persistent")
+            return True
+        except Exception as exc:
+            self._persistent = False
+            log.info("wiki.pages_disk_only", reason=str(exc))
+            return False
+
+    @property
+    def is_persistent(self) -> bool:
+        return self._persistent
 
     # ---- read ---------------------------------------------------------
 
@@ -123,6 +180,16 @@ class WikiStorage:
         return resolved
 
     def read(self, rel: str) -> WikiPage | None:
+        # Validate path even when Postgres serves the content: `rel` still
+        # names a page in the wiki namespace and must not escape the root.
+        self.page_path(rel)
+        if self._persistent:
+            page = self._read_pg(rel)
+            if page is not None:
+                return page
+        return self._read_disk(rel)
+
+    def _read_disk(self, rel: str) -> WikiPage | None:
         p = self.page_path(rel)
         if not p.exists():
             return None
@@ -132,14 +199,81 @@ class WikiStorage:
             return None
         return WikiPage(rel=rel, frontmatter=dict(post.metadata), body=post.content)
 
+    def _read_pg(self, rel: str) -> WikiPage | None:
+        if self.settings is None:
+            return None
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    SELECT frontmatter, body
+                      FROM agentcore_wiki_pages
+                     WHERE project_id = %s
+                       AND branch = %s
+                       AND rel = %s
+                    """,
+                    (self.project, self.branch, rel),
+                )
+                row = cur.fetchone()
+        except Exception as exc:
+            log.warning("wiki.page_read_failed", rel=rel, error=str(exc))
+            return None
+        if not row:
+            return None
+        fm, body = row
+        return WikiPage(
+            rel=rel,
+            frontmatter=fm if isinstance(fm, dict) else {},
+            body=str(body or ""),
+        )
+
     def walk(self) -> Iterator[WikiPage]:
+        yielded: set[str] = set()
+        if self._persistent:
+            for page in self._walk_pg():
+                yielded.add(page.rel)
+                yield page
         if not self.root.exists():
             return
         for p in sorted(self.root.rglob("*.md")):
             rel = p.relative_to(self.root).as_posix()
-            page = self.read(rel)
+            if rel in yielded:
+                continue
+            page = self._read_disk(rel)
             if page is not None:
                 yield page
+
+    def _walk_pg(self) -> Iterator[WikiPage]:
+        if self.settings is None:
+            return
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    SELECT rel, frontmatter, body
+                      FROM agentcore_wiki_pages
+                     WHERE project_id = %s
+                       AND branch = %s
+                  ORDER BY rel ASC
+                    """,
+                    (self.project, self.branch),
+                )
+                rows = cur.fetchall() or []
+        except Exception as exc:
+            log.warning("wiki.page_walk_failed", error=str(exc))
+            return
+        for rel, fm, body in rows:
+            yield WikiPage(
+                rel=str(rel),
+                frontmatter=fm if isinstance(fm, dict) else {},
+                body=str(body or ""),
+            )
 
     # ---- write --------------------------------------------------------
 
@@ -162,6 +296,9 @@ class WikiStorage:
         if existing is not None and existing.frontmatter.get("content_hash") == new.frontmatter[
             "content_hash"
         ]:
+            # Still mirror to Postgres so a disk-only page backfills on the
+            # next no-op curator write.
+            self._write_pg(new)
             return False
 
         target = self.page_path(new.rel)
@@ -182,14 +319,72 @@ class WikiStorage:
             with suppress(OSError):
                 os.unlink(tmp_path)
             raise
+        self._write_pg(new)
         return True
+
+    def _write_pg(self, page: WikiPage) -> None:
+        if not self._persistent or self.settings is None:
+            return
+        with suppress(Exception):
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    INSERT INTO agentcore_wiki_pages
+                      (project_id, branch, rel, title, frontmatter, body,
+                       content_hash, updated_at)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, now())
+                    ON CONFLICT (project_id, branch, rel)
+                    DO UPDATE SET
+                      title = EXCLUDED.title,
+                      frontmatter = EXCLUDED.frontmatter,
+                      body = EXCLUDED.body,
+                      content_hash = EXCLUDED.content_hash,
+                      updated_at = now()
+                    """,
+                    (
+                        self.project,
+                        self.branch,
+                        page.rel,
+                        page.title,
+                        json.dumps(page.frontmatter),
+                        page.body,
+                        str(page.frontmatter.get("content_hash") or ""),
+                    ),
+                )
 
     def delete(self, rel: str) -> bool:
         p = self.page_path(rel)
-        if not p.exists():
+        disk_deleted = False
+        if p.exists():
+            p.unlink()
+            disk_deleted = True
+        db_deleted = self._delete_pg(rel)
+        return disk_deleted or db_deleted
+
+    def _delete_pg(self, rel: str) -> bool:
+        if not self._persistent or self.settings is None:
             return False
-        p.unlink()
-        return True
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    DELETE FROM agentcore_wiki_pages
+                     WHERE project_id = %s
+                       AND branch = %s
+                       AND rel = %s
+                    """,
+                    (self.project, self.branch, rel),
+                )
+                return (cur.rowcount or 0) > 0
+        except Exception as exc:
+            log.warning("wiki.page_delete_failed", rel=rel, error=str(exc))
+            return False
 
     # ---- helpers ------------------------------------------------------
 

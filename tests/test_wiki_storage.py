@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+from pydantic_settings import SettingsConfigDict
+
+import agentcore.wiki.storage as storage_module
+from agentcore.settings import Settings
 from agentcore.wiki.storage import WikiPage, WikiStorage
 
 
@@ -123,3 +128,111 @@ def test_rejects_path_traversal(tmp_path: Path) -> None:
             pass
         else:  # pragma: no cover - assertion branch
             raise AssertionError(f"expected traversal rejection for {rel!r}")
+
+
+class _IsolatedSettings(Settings):
+    """Settings that ignore host `.env` so tests stay deterministic."""
+
+    model_config = SettingsConfigDict(env_file=None, extra="ignore", case_sensitive=False)
+
+
+class _Cursor:
+    def __init__(
+        self,
+        *,
+        one: tuple[Any, ...] | None = None,
+        many: list[tuple[Any, ...]] | None = None,
+        rowcount: int = 0,
+    ) -> None:
+        self.one = one
+        self.many = many or []
+        self.rowcount = rowcount
+        self.statements: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    def __enter__(self) -> "_Cursor":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        self.statements.append((sql, params))
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        return self.one
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return self.many
+
+
+class _Connection:
+    def __init__(self, cursor: _Cursor) -> None:
+        self._cursor = cursor
+
+    def __enter__(self) -> "_Connection":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def cursor(self) -> _Cursor:
+        return self._cursor
+
+
+def _persistent_storage(tmp_path: Path, cursor: _Cursor, monkeypatch) -> WikiStorage:
+    s = _new_storage(tmp_path)
+    s.settings = _IsolatedSettings()
+    s._persistent = True
+    monkeypatch.setattr(
+        storage_module.psycopg,
+        "connect",
+        lambda *_args, **_kwargs: _Connection(cursor),
+    )
+    return s
+
+
+def test_read_prefers_postgres_page_over_disk(tmp_path: Path, monkeypatch) -> None:
+    disk = _new_storage(tmp_path)
+    disk.write(WikiPage(rel="x.md", frontmatter={"title": "disk"}, body="disk body"))
+
+    cursor = _Cursor(one=({"title": "db", "sources": ["db.py"]}, "db body"))
+    s = _persistent_storage(tmp_path, cursor, monkeypatch)
+
+    page = s.read("x.md")
+
+    assert page is not None
+    assert page.title == "db"
+    assert page.body == "db body"
+
+
+def test_walk_unions_postgres_and_disk_preferring_postgres(
+    tmp_path: Path, monkeypatch
+) -> None:
+    disk = _new_storage(tmp_path)
+    disk.write(WikiPage(rel="x.md", frontmatter={"title": "disk-x"}, body="disk x"))
+    disk.write(WikiPage(rel="y.md", frontmatter={"title": "disk-y"}, body="disk y"))
+
+    cursor = _Cursor(
+        many=[
+            ("x.md", {"title": "db-x"}, "db x"),
+            ("z.md", {"title": "db-z"}, "db z"),
+        ]
+    )
+    s = _persistent_storage(tmp_path, cursor, monkeypatch)
+
+    pages = {p.rel: p for p in s.walk()}
+
+    assert sorted(pages) == ["x.md", "y.md", "z.md"]
+    assert pages["x.md"].body == "db x"
+    assert pages["y.md"].body == "disk y"
+    assert pages["z.md"].body == "db z"
+
+
+def test_delete_returns_true_when_only_postgres_row_deleted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cursor = _Cursor(rowcount=1)
+    s = _persistent_storage(tmp_path, cursor, monkeypatch)
+
+    assert s.delete("db-only.md") is True
+    assert "DELETE FROM agentcore_wiki_pages" in cursor.statements[-1][0]
