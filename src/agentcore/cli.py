@@ -457,6 +457,27 @@ async def _plan_async_body(
         graph=graph, graphify=graphify, retriever=retriever,
     )
 
+    # Pre-chain wiki bootstrap — when wiki is enabled and the project
+    # has zero pages, seed module pages BEFORE the architect runs so
+    # agents can pull project context from the retriever. Cold start
+    # only; warm projects skip this and rely on the post-converge
+    # incremental refresh. Best-effort: a wiki failure must not block
+    # the chain.
+    if settings.enable_wiki:
+        try:
+            storage_check, _, curator = _build_wiki_stack(settings, repo_abs)
+            if not list(storage_check.walk()):
+                console.print(
+                    "[dim]wiki: seeding pages for project (cold start)…[/dim]"
+                )
+                seeded = await curator.seed_from_repo(repo_abs)
+                if seeded:
+                    console.print(
+                        f"[dim]wiki: seeded {len(seeded)} page(s)[/dim]"
+                    )
+        except Exception as exc:
+            console.print(f"[yellow]wiki bootstrap skipped:[/yellow] {exc}")
+
     state, task_id = await _safe_run_chain(runtime, brief, chain, max_hops)
 
     # Review loop — default ON. If any role rejects, route back to the

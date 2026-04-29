@@ -79,8 +79,23 @@ class AgentRegistry:
     def load_dir(self, directory: Path | str) -> None:
         d = Path(directory)
         if not d.exists():
-            log.warning("agents_dir.missing", path=str(d))
-            return
+            # Fallback: resolve against the agentcore package's repo root
+            # so a relative `agents/` default still finds the bundled
+            # specs even when the CLI is invoked from outside the repo.
+            bundled = (
+                Path(__file__).resolve().parent.parent.parent.parent
+                / "agents"
+            )
+            if bundled.exists() and bundled != d.resolve():
+                log.info(
+                    "agents_dir.using_bundled",
+                    requested=str(d),
+                    bundled=str(bundled),
+                )
+                d = bundled
+            else:
+                log.warning("agents_dir.missing", path=str(d))
+                return
         for path in sorted(d.glob(AGENT_GLOB)):
             self._load_one(path)
 
