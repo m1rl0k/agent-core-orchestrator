@@ -96,3 +96,78 @@ def ensure_postgres(
         time.sleep(poll_interval)
     log.warning("postgres.boot_timeout", timeout_seconds=boot_timeout)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Schema drift check
+# ---------------------------------------------------------------------------
+
+
+def verify_schema(
+    settings: Settings, *, strict: bool = False
+) -> tuple[bool, str | None, str | None]:
+    """Compare alembic head against the live DB revision.
+
+    Returns `(ok, head, current)`. `ok=True` means head matches what's in
+    `alembic_version`. `ok=False` means either the table is missing
+    (init_schema fallback ran but `alembic upgrade head` was never
+    invoked) or the DB is on an older revision than the bundled
+    migrations.
+
+    On mismatch, logs a structured warning. If `strict=True` and there's
+    a real mismatch (not "no DB / no alembic"), raises `RuntimeError`
+    so production deploys can fail-closed when migrations are out of
+    sync. Default is warn-only so dev iteration isn't blocked.
+    """
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    alembic_ini = repo_root / "alembic.ini"
+    if not alembic_ini.exists():
+        log.info("schema.no_alembic_ini", path=str(alembic_ini))
+        return True, None, None
+
+    try:
+        from alembic.config import Config
+        from alembic.runtime.migration import MigrationContext
+        from alembic.script import ScriptDirectory
+    except ImportError:
+        log.info("schema.alembic_unavailable")
+        return True, None, None
+
+    try:
+        cfg = Config(str(alembic_ini))
+        script = ScriptDirectory.from_config(cfg)
+        head = script.get_current_head()
+    except Exception as exc:
+        log.warning("schema.head_unreadable", error=str(exc))
+        return True, None, None
+
+    current: str | None = None
+    try:
+        with psycopg.connect(settings.pg_dsn, autocommit=True) as conn:
+            ctx = MigrationContext.configure(conn.cursor())
+            current = ctx.get_current_revision()
+    except Exception as exc:
+        log.warning("schema.current_unreadable", error=str(exc))
+        # Can't read DB — don't block startup; ensure_postgres handles
+        # connectivity separately.
+        return True, head, None
+
+    if current == head:
+        log.info("schema.ok", revision=head)
+        return True, head, current
+
+    if current is None:
+        msg = (
+            "alembic_version table missing; running on init_schema() "
+            "fallbacks. Run `agentcore migrate upgrade` to apply migrations "
+            f"(head={head})."
+        )
+    else:
+        msg = (
+            f"schema drift: DB at {current!r} but bundled head is {head!r}. "
+            "Run `agentcore migrate upgrade` to apply pending migrations."
+        )
+    log.warning("schema.drift", head=head, current=current, message=msg)
+    if strict:
+        raise RuntimeError(msg)
+    return False, head, current

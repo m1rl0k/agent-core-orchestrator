@@ -139,6 +139,13 @@ def build_app() -> FastAPI:
         step = int(payload.get("step", 0))
         hops_so_far = list(payload.get("hops", []))
 
+        # Cooperative cancel: DELETE /chains/{id} stamps the idem slot
+        # with status='cancelled'. Honour it before doing any work so a
+        # cancel between two queued hops actually stops the chain.
+        existing = idem_cache.get("chain", chain_id, project_id=pid)
+        if isinstance(existing, dict) and existing.get("status") == "cancelled":
+            return
+
         handoff = Handoff(**payload["handoff"])
         try:
             outcome, nxt = await runtime.execute(handoff)
@@ -213,7 +220,14 @@ def build_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        from agentcore.state.bootstrap import verify_schema
         from agentcore.state.jobs import run_worker as _run_worker
+
+        # Schema drift check. Logs a structured warning if alembic head
+        # doesn't match `alembic_version` in the DB; raises if
+        # AGENTCORE_STRICT_SCHEMA=true so production deploys behind
+        # `alembic upgrade head` fail loudly when migrations are stale.
+        verify_schema(settings, strict=settings.strict_schema)
 
         stop = asyncio.Event()
         watcher = asyncio.create_task(
@@ -226,7 +240,11 @@ def build_app() -> FastAPI:
         worker = None
         if job_handlers:
             worker = asyncio.create_task(
-                _run_worker(job_queue, job_handlers, stop_event=stop)
+                _run_worker(
+                    job_queue, job_handlers,
+                    stop_event=stop,
+                    kind_limits=settings.kind_limits or None,
+                )
             )
 
         # Periodic cleanup so durable tables don't grow unbounded.
@@ -463,7 +481,7 @@ def build_app() -> FastAPI:
         """Status of a durable chain.
 
         Returned shapes:
-          - terminal: {chain_id, status: "done"|"failed", hops: [...]}
+          - terminal: {chain_id, status: "done"|"failed"|"cancelled", hops: [...]}
           - in-flight: {chain_id, status: "running"}
           - unknown: 404
         """
@@ -475,6 +493,78 @@ def build_app() -> FastAPI:
         # the cache TTL expired. We return 'running' so polling clients
         # don't 404 spuriously between hops.
         return {"chain_id": chain_id, "status": "running"}
+
+    @app.delete(
+        "/chains/{chain_id}",
+        dependencies=[Depends(require_api_token)],
+    )
+    async def cancel_chain(
+        chain_id: str,
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    ) -> dict[str, Any]:
+        """Cancel an in-flight durable chain.
+
+        Soft cancel: any queued `runtime.chain.advance` job for this
+        chain is marked `cancelled`; the handler reads the chain idem
+        slot at the top of every hop and bails if it sees
+        `status='cancelled'`. An in-flight hop already inside the
+        runtime is NOT interrupted (the LLM call runs to its SLA), but
+        the next hop will not be enqueued.
+        """
+        pid = project_id or settings.project_name
+        # 1. Stamp the chain idem slot first so the in-flight handler
+        #    sees the cancel before it would re-enqueue the next hop.
+        idem_cache.put(
+            "chain",
+            chain_id,
+            {
+                "chain_id": chain_id,
+                "status": "cancelled",
+                "hops": [],
+            },
+            project_id=pid,
+            ttl_seconds=86400.0,
+        )
+        # 2. Mark queued/locked successors so workers skip them too.
+        cancelled = job_queue.cancel_chain(chain_id, project_id=pid)
+        return {
+            "chain_id": chain_id,
+            "status": "cancelled",
+            "jobs_cancelled": cancelled,
+        }
+
+    @app.get(
+        "/jobs/dead-letter",
+        dependencies=[Depends(require_api_token)],
+    )
+    async def dead_letter_list(
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Inspect permanently-failed jobs (status='dead_letter').
+
+        Dead-letter rows are NOT auto-deleted by the cleanup loop, so
+        they accumulate until purged via `DELETE /jobs/dead-letter`.
+        """
+        pid = project_id or settings.project_name
+        rows = job_queue.list_dead_letter(project_id=pid, limit=limit)
+        return {"project_id": pid, "count": len(rows), "items": rows}
+
+    @app.delete(
+        "/jobs/dead-letter",
+        dependencies=[Depends(require_api_token)],
+    )
+    async def dead_letter_purge(
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+        older_than_days: int | None = None,
+    ) -> dict[str, Any]:
+        """Purge dead-letter rows. `older_than_days=null` (default)
+        wipes all of them for the project; pass an int to keep recents."""
+        pid = project_id or settings.project_name
+        n = job_queue.purge_dead_letter(
+            project_id=pid, older_than_days=older_than_days
+        )
+        return {"project_id": pid, "purged": n}
 
     @app.get("/tasks/{task_id}/trace")
     async def trace(task_id: str) -> dict[str, Any]:

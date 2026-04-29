@@ -34,7 +34,7 @@ contract:
   delegates_to: [qa]
   # Runaway protection — multi-file diffs on thinking models can take a
   # few minutes; this is the upper bound, not the target.
-  sla_seconds: 1200
+  sla_seconds: 2400
 
 knowledge:
   rag_collections: [code, wiki]

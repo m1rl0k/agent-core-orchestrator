@@ -23,6 +23,16 @@ class Settings(BaseSettings):
 
     # Agent library
     agents_dir: Path = Field(Path("./agents"), alias="AGENTCORE_AGENTS_DIR")
+    # Project-wide rules prepended to every agent's system prompt. Edit
+    # freely; the runtime re-reads it on each hop (mtime-cached) so live
+    # tweaks land without restart.
+    rules_path: Path = Field(Path("./RULES.md"), alias="AGENTCORE_RULES_PATH")
+    # Fail-fast on schema drift. When true, the orchestrator refuses to
+    # boot if `alembic_version` doesn't match the bundled migration head
+    # — recommended for production deploys behind `alembic upgrade head`.
+    # Dev default (false) just logs a loud warning so iteration isn't
+    # blocked when you forget to migrate.
+    strict_schema: bool = Field(False, alias="AGENTCORE_STRICT_SCHEMA")
 
     # Postgres
     pg_host: str = Field("localhost", alias="PGHOST")
@@ -69,9 +79,28 @@ class Settings(BaseSettings):
     # Generous default — thinking models burn 30-90s on chain-of-thought
     # before emitting. Per-agent SLA (`sla_seconds` in agent.md) is the
     # outer wall-clock; this is the inner per-call cap.
-    llm_timeout_seconds: float = Field(300.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
+    llm_timeout_seconds: float = Field(600.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
     llm_max_retries: int = Field(3, alias="AGENTCORE_LLM_MAX_RETRIES")
     llm_max_concurrency: int = Field(4, alias="AGENTCORE_LLM_MAX_CONCURRENCY")
+
+    # Cluster-wide concurrency cap per job kind, expressed as JSON. e.g.
+    # `{"wiki_refresh": 1, "remediation_run": 4}`. Kinds absent from the
+    # dict are unbounded. Empty (default) means no per-kind cap.
+    worker_kind_limits: str = Field("{}", alias="AGENTCORE_WORKER_KIND_LIMITS")
+
+    @property
+    def kind_limits(self) -> dict[str, int]:
+        """Parsed `worker_kind_limits`. Invalid JSON is logged once
+        elsewhere and returns {} so a typo can't sink the worker loop."""
+        import json as _json
+
+        try:
+            data = _json.loads(self.worker_kind_limits or "{}")
+        except _json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
 
     # Per-call context budget. ~200k tokens is the safe lowest-common-
     # denominator across our supported models (Claude, Kimi K2, GLM-4.6,
@@ -84,7 +113,7 @@ class Settings(BaseSettings):
 
     # Max wall-clock for an entire `/run` chain across all hops. Caps runaway
     # loops without clamping per-call throughput. Set 0 to disable.
-    max_chain_seconds: int = Field(1800, alias="AGENTCORE_MAX_CHAIN_SECONDS")
+    max_chain_seconds: int = Field(7200, alias="AGENTCORE_MAX_CHAIN_SECONDS")
 
     # Periodic cleanup of expired idempotency rows + done/failed jobs past
     # the retention window. Idempotency rows already self-expire via TTL on

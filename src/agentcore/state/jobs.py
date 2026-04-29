@@ -342,10 +342,15 @@ class JobQueue:
                     return
                 attempts, max_attempts = int(row[0]), int(row[1])
                 if attempts >= max_attempts:
+                    # Final failure → dead-letter. Distinct from `failed`
+                    # (transient) so cleanup() can preserve them for
+                    # human review; `claim` ignores them naturally
+                    # because the WHERE clause only matches queued /
+                    # expired-running rows.
                     cur.execute(
                         """
                         UPDATE agentcore_jobs
-                           SET status = 'failed', error = %s, finished_at = now(),
+                           SET status = 'dead_letter', error = %s, finished_at = now(),
                                locked_by = NULL, locked_until = NULL
                          WHERE id = %s
                         """,
@@ -383,6 +388,8 @@ class JobQueue:
             )
 
     def cleanup(self, retention_days: int = 7) -> int:
+        """Purge old `done` rows. `dead_letter` is preserved indefinitely
+        for human review; use `purge_dead_letter()` to evict explicitly."""
         if not self._persistent:
             return 0
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
@@ -394,13 +401,122 @@ class JobQueue:
                 cur.execute(
                     """
                     DELETE FROM agentcore_jobs
-                     WHERE status IN ('done','failed') AND finished_at < %s
+                     WHERE status = 'done' AND finished_at < %s
                     """,
                     (cutoff,),
                 )
                 return cur.rowcount or 0
         except Exception as exc:
             log.warning("jobs.cleanup_failed", error=str(exc))
+            return 0
+
+    def list_dead_letter(
+        self,
+        *,
+        project_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return the most-recent dead-letter rows for inspection."""
+        if not self._persistent:
+            return []
+        pid = project_id or self.settings.project_name
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    SELECT id, kind, payload, attempts, max_attempts,
+                           error, created_at, finished_at
+                      FROM agentcore_jobs
+                     WHERE status = 'dead_letter' AND project_id = %s
+                  ORDER BY finished_at DESC NULLS LAST
+                     LIMIT %s
+                    """,
+                    (pid, int(limit)),
+                )
+                return [
+                    {
+                        "id": r[0], "kind": r[1], "payload": r[2],
+                        "attempts": r[3], "max_attempts": r[4],
+                        "error": r[5],
+                        "created_at": r[6].isoformat() if r[6] else None,
+                        "finished_at": r[7].isoformat() if r[7] else None,
+                    }
+                    for r in cur.fetchall() or []
+                ]
+        except Exception as exc:
+            log.warning("jobs.list_dead_letter_failed", error=str(exc))
+            return []
+
+    def purge_dead_letter(
+        self,
+        *,
+        project_id: str | None = None,
+        older_than_days: int | None = None,
+    ) -> int:
+        """Delete dead-letter rows. `older_than_days=None` purges all of
+        them for the project; pass a number to retain recent ones."""
+        if not self._persistent:
+            return 0
+        pid = project_id or self.settings.project_name
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                if older_than_days is None:
+                    cur.execute(
+                        "DELETE FROM agentcore_jobs "
+                        "WHERE status = 'dead_letter' AND project_id = %s",
+                        (pid,),
+                    )
+                else:
+                    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+                    cur.execute(
+                        "DELETE FROM agentcore_jobs "
+                        "WHERE status = 'dead_letter' AND project_id = %s "
+                        "AND finished_at < %s",
+                        (pid, cutoff),
+                    )
+                return cur.rowcount or 0
+        except Exception as exc:
+            log.warning("jobs.purge_dead_letter_failed", error=str(exc))
+            return 0
+
+    def cancel_chain(self, chain_id: str, *, project_id: str | None = None) -> int:
+        """Mark queued chain-advance jobs for `chain_id` as cancelled.
+
+        The handler also cooperatively no-ops if the chain idempotency
+        cache slot has `status='cancelled'`, so an in-flight hop that
+        completes will not enqueue a successor. Returns the number of
+        jobs marked.
+        """
+        if not self._persistent:
+            return 0
+        pid = project_id or self.settings.project_name
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    UPDATE agentcore_jobs
+                       SET status = 'cancelled', finished_at = now(),
+                           locked_by = NULL, locked_until = NULL,
+                           error = COALESCE(error, '') || ' [cancelled]'
+                     WHERE project_id = %s
+                       AND kind = 'runtime.chain.advance'
+                       AND status IN ('queued','running')
+                       AND payload->>'chain_id' = %s
+                    """,
+                    (pid, chain_id),
+                )
+                return cur.rowcount or 0
+        except Exception as exc:
+            log.warning("jobs.cancel_chain_failed", error=str(exc))
             return 0
 
 

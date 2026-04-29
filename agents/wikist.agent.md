@@ -39,7 +39,7 @@ contract:
     - { name: notes,           type: string,            required: false, description: "Free-form summary for human review" }
   accepts_handoff_from: [user, ops, scheduled_scan]
   delegates_to: []
-  sla_seconds: 600
+  sla_seconds: 1800
 
 # ─── Knowledge bindings ───────────────────────────────────────────────────
 # The curator reads from the code collection (raw source) and writes to

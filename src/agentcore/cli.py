@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -334,6 +335,12 @@ async def _plan_async(
 
     settings = get_settings()
     configure_logging(settings.log_level)
+
+    # Make the repo path visible to runtime executors (e.g. the polyglot
+    # `tests` runner needs to know which repo to clone into a worktree).
+    # Setting an env var rather than threading the path through every
+    # handoff keeps the contracts unchanged.
+    os.environ["AGENTCORE_REPO_ROOT"] = str(repo.resolve())
 
     registry = AgentRegistry()
     registry.load_dir(settings.agents_dir)
@@ -1123,7 +1130,6 @@ def wiki_install_hook(
     can run `python` directly. We avoid bash-isms (chmod, tr, sed) so
     nothing is OS-specific in the script itself.
     """
-    import os
     import stat
 
     repo_root = Path(repo).resolve()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -29,6 +30,7 @@ from agentcore.contracts.envelopes import (
     validate_payload,
 )
 from agentcore.llm.router import ChatMessage, LLMRouter
+from agentcore.llm.tokens import count_tokens
 from agentcore.memory.graph import KnowledgeGraph
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.retrieval.hybrid import HybridRetriever
@@ -36,14 +38,33 @@ from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry
 from agentcore.spec.models import AgentSpec, Contract
 
-# Approx chars-per-token for English+JSON. Used to convert the
-# `llm_context_budget_tokens` setting into a chars budget cheaply
-# (without a real tokenizer).
-_CHARS_PER_TOKEN = 3.0
-# Headroom we reserve for system prompt + schema hint + retrieval block.
-# Conservative: well-equipped agents can carry a 4-10k system prompt and
-# we still want a healthy reply window inside the 200k budget.
-_NON_PAYLOAD_CHARS = 20_000
+# Headroom we reserve (in TOKENS) for system prompt overhead, JSON schema
+# hint, retrieval block, and reply space inside the budget. Conservative
+# enough that agents with 4-10k system prompts still fit comfortably.
+_NON_PAYLOAD_TOKENS = 8_000
+
+
+# Mtime-cached read of the project RULES.md so live edits land on the
+# next hop without restarting the orchestrator. Empty / missing file is
+# fine — agents fall back to their own system prompts.
+_RULES_CACHE: tuple[str, float, str] | None = None
+
+
+def _load_rules(path: Path) -> str:
+    global _RULES_CACHE
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    cache_key = (str(path), st.st_mtime)
+    if _RULES_CACHE is not None and (_RULES_CACHE[0], _RULES_CACHE[1]) == cache_key:
+        return _RULES_CACHE[2]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    _RULES_CACHE = (str(path), st.st_mtime, text)
+    return text
 
 log = structlog.get_logger(__name__)
 
@@ -101,7 +122,26 @@ class Runtime:
                 f"agent {spec.name!r} does not accept handoffs from {handoff.from_agent!r}"
             )
 
-        # 2. Payload validation
+        # 2. Pre-LLM executors (e.g. polyglot test runner). They run in
+        #    declaration order, each merging structured output into the
+        #    handoff payload so the LLM sees real tool results instead
+        #    of inventing them. The QA agent declares `executors: [tests]`
+        #    so its `test_run` field arrives populated, not imagined.
+        if spec.executors:
+            from agentcore.runtime.executors import run_executor
+
+            new_payload = dict(handoff.payload)
+            for name in spec.executors:
+                merged = await run_executor(name, new_payload)
+                if merged:
+                    new_payload.update(merged)
+                    self._record(
+                        handoff.task_id, handoff.step, "executor",
+                        spec.name, {"name": name, "fields": list(merged.keys())},
+                    )
+            handoff = handoff.model_copy(update={"payload": new_payload})
+
+        # 3. Payload validation
         try:
             validate_payload(
                 spec.contract.inputs, handoff.payload, agent=spec.name, direction="input"
@@ -238,34 +278,45 @@ class Runtime:
     ) -> list[dict[str, Any]]:
         """Decide whether the rendered hop fits the budget. If not, split
         the largest list-valued input field into chunks; non-list fields
-        are duplicated across chunks so each batch sees full context."""
-        budget_chars = int(
-            get_settings().llm_context_budget_tokens * _CHARS_PER_TOKEN
-        )
+        are duplicated across chunks so each batch sees full context.
+
+        Uses `count_tokens` (tiktoken o200k_base by default; HF tokenizer
+        if a matching JSON sits in `vendor/tokenizers/`; char-estimate
+        as last-resort floor) so the decision is grounded in real token
+        counts, not a chars/3 heuristic.
+        """
+        budget = int(get_settings().llm_context_budget_tokens)
+        hint = spec.llm.model
         payload = handoff.payload
-        sys_chars = len(spec.system_prompt or "")
-        payload_chars = len(json.dumps(payload, default=str))
-        if sys_chars + payload_chars + _NON_PAYLOAD_CHARS <= budget_chars:
+        sys_tokens = count_tokens(spec.system_prompt or "", model_hint=hint)
+        payload_tokens = count_tokens(
+            json.dumps(payload, default=str), model_hint=hint
+        )
+        if sys_tokens + payload_tokens + _NON_PAYLOAD_TOKENS <= budget:
             return [payload]
         list_fields = [(k, v) for k, v in payload.items() if isinstance(v, list)]
         if not list_fields:
             return [payload]
         largest_key, largest_val = max(
             list_fields,
-            key=lambda kv: len(json.dumps(kv[1], default=str)),
+            key=lambda kv: count_tokens(
+                json.dumps(kv[1], default=str), model_hint=hint
+            ),
         )
         if len(largest_val) < 2:
             return [payload]
         base = {k: v for k, v in payload.items() if k != largest_key}
-        base_chars = len(json.dumps(base, default=str))
-        available = budget_chars - sys_chars - base_chars - _NON_PAYLOAD_CHARS
-        if available < 1000:
+        base_tokens = count_tokens(json.dumps(base, default=str), model_hint=hint)
+        available = budget - sys_tokens - base_tokens - _NON_PAYLOAD_TOKENS
+        if available < 500:
             # Base alone is over budget; we can't split usefully. Let the
             # LLM see what it sees and fail loud.
             return [payload]
-        largest_chars = len(json.dumps(largest_val, default=str))
-        chars_per_item = max(1, largest_chars // len(largest_val))
-        items_per_chunk = max(1, available // chars_per_item)
+        largest_tokens = count_tokens(
+            json.dumps(largest_val, default=str), model_hint=hint
+        )
+        tokens_per_item = max(1, largest_tokens // len(largest_val))
+        items_per_chunk = max(1, available // tokens_per_item)
         return [
             {**base, largest_key: largest_val[i : i + items_per_chunk]}
             for i in range(0, len(largest_val), items_per_chunk)
@@ -486,7 +537,11 @@ class Runtime:
             f"Values: {', '.join(spec.soul.values) or 'n/a'}. "
             f"Forbidden: {', '.join(spec.soul.forbidden) or 'n/a'}."
         )
-        system = f"{spec.system_prompt}\n\n{soul}\n\n{schema}".strip()
+        rules = _load_rules(get_settings().rules_path)
+        rules_block = f"# PROJECT RULES\n{rules}\n\n" if rules else ""
+        system = (
+            f"{rules_block}{spec.system_prompt}\n\n{soul}\n\n{schema}"
+        ).strip()
         context_block = await self._build_context_block(spec, handoff)
         user = (
             f"Inbound handoff from `{handoff.from_agent}` (task {handoff.task_id}, "

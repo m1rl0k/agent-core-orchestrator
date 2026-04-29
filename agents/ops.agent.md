@@ -34,7 +34,7 @@ contract:
   accepts_handoff_from: [user, qa, architect]
   delegates_to: [architect]
   # Runaway protection — pipeline + signal triage cycles.
-  sla_seconds: 600
+  sla_seconds: 1800
 
 knowledge:
   rag_collections: [code, decisions, wiki]

@@ -93,6 +93,11 @@ class AgentSpec(BaseModel):
     soul: Soul
     contract: Contract = Field(default_factory=Contract)
     knowledge: KnowledgeBinding = Field(default_factory=KnowledgeBinding)
+    # Pre-LLM executors. Names registered in `agentcore.runtime.executors`
+    # (e.g. "pytest"). The runtime runs each before the LLM call and
+    # merges its structured result into the handoff payload, grounding
+    # the LLM in real tool output instead of inviting it to invent.
+    executors: list[str] = Field(default_factory=list)
 
     # The body of the markdown file becomes the system prompt.
     system_prompt: str = ""

@@ -24,6 +24,13 @@ contract:
     - { name: plan_summary, type: string, required: true }
     - { name: diffs,        type: list,   required: true }
     - { name: notes,        type: string, required: false }
+    # Populated by the `tests` executor before the LLM runs: real
+    # pytest / go test / cargo test / jest / mvn / ctest results from a
+    # sandbox worktree. Optional because the executor reports
+    # `executor_status` like `no_runner` when no test framework is on
+    # PATH — QA still produces a verdict in that case, just without
+    # ground truth.
+    - { name: test_run,     type: dict,   required: false }
   outputs:
     - { name: suite_summary, type: string,                required: true }
     - { name: passed,        type: "list[string]",        required: true }
@@ -32,12 +39,20 @@ contract:
   accepts_handoff_from: [developer]
   delegates_to: [developer, ops]
   # Runaway protection — test design + execution on a thinking model.
-  sla_seconds: 1200
+  sla_seconds: 2400
 
 knowledge:
   rag_collections: [code, wiki]
   graph_communities: [dependencies]
   code_scopes: ["**/*"]
+
+# Pre-LLM executor: actually run the test suite against the developer's
+# diffs in a temp git worktree. Polyglot — auto-detects pytest / go test /
+# cargo test / jest / mvn / gradle / dotnet / ctest / rspec / phpunit and
+# uses whatever is already on PATH. Never installs anything; if no runner
+# is detected the QA LLM sees `executor_status='no_runner'` and proceeds
+# without ground truth.
+executors: [tests]
 ---
 
 You are **QA**.

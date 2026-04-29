@@ -38,7 +38,7 @@ contract:
   # Runaway protection only — generous for thinking models that burn
   # 30-90s on chain-of-thought before emitting tokens. Well-behaved
   # planning runs finish in well under a minute.
-  sla_seconds: 600
+  sla_seconds: 1800
 
 # ─── Knowledge bindings ───────────────────────────────────────────────────
 knowledge:

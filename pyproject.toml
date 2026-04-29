@@ -56,6 +56,14 @@ dependencies = [
   # In-process embeddings (Nomic-1.5 via fastembed). Tiny model, no
   # external server (no Ollama needed).
   "fastembed>=0.3",
+
+  # Real token counting. tiktoken bundles its encodings (o200k_base,
+  # cl100k_base, ...) so it works fully offline — no HuggingFace hub
+  # round-trip. We use it as the primary tokenizer for the context
+  # budget split decision; HF `tokenizers` is the optional per-provider
+  # fallback (see `vendor/tokenizers/`).
+  "tiktoken>=0.7",
+  "tokenizers>=0.19",
 ]
 
 [project.optional-dependencies]
