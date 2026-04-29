@@ -90,20 +90,39 @@ class WikiCurator:
         *,
         glob: str = _DEFAULT_GLOB,
         commit_sha: str | None = None,
+        force: bool = False,
     ) -> list[str]:
         """Bulk-produce module pages for every top-level package under `repo_root`.
 
-        Returns the list of wiki rel-paths that were written or refreshed.
+        Smart by default: when an on-disk page already exists for a module
+        and none of its `sources[]` have been modified since the page was
+        written, the LLM call is skipped entirely. Pass `force=True` to
+        re-render every module unconditionally (useful after a prompt or
+        contract change).
         """
         groups = self._group_files_by_module(Path(repo_root), glob)
         written: list[str] = []
+        skipped_unchanged = 0
         for module, files in groups.items():
+            rel = f"modules/{module}.md"
+            existing = self.storage.read(rel)
+            if not force and existing is not None and not self._needs_refresh(
+                existing, files
+            ):
+                skipped_unchanged += 1
+                continue
             page = await self._render_module_page(module, files, repo_root)
             if page is None:
                 continue
             if self.storage.write(page, commit_sha=commit_sha):
                 await self.index.upsert_page(page)
                 written.append(page.rel)
+        if skipped_unchanged:
+            log.info(
+                "wiki.seed_skipped_unchanged",
+                modules=skipped_unchanged,
+                hint="re-run with `--force` to regenerate every page",
+            )
         # Always (re)write the index page after a seed — it summarises what's there.
         idx = self._render_index_page()
         if self.storage.write(idx, commit_sha=commit_sha):
@@ -328,6 +347,35 @@ class WikiCurator:
     # immediately before the page's audit timestamp tests as "newer" by
     # ~0.x seconds and gets falsely flagged as stale.
     _STALE_SLACK_SECONDS = 2.0
+
+    @staticmethod
+    def _needs_refresh(existing: WikiPage, candidate_files: list[Path]) -> bool:
+        """Decide whether an existing module page should be re-rendered.
+
+        True iff:
+          - the page has no `last_updated` timestamp (legacy page), OR
+          - the set of source files changed (added/removed module files), OR
+          - any current source file's mtime is newer than `last_updated`
+            beyond the slack window.
+        """
+        last_updated = existing.frontmatter.get("last_updated")
+        if not last_updated:
+            return True
+        recorded = {Path(s).as_posix() for s in existing.sources}
+        current = {p.as_posix() for p in candidate_files}
+        if recorded and recorded != current:
+            return True
+        try:
+            cutoff = datetime.fromisoformat(last_updated).timestamp()
+        except (TypeError, ValueError):
+            return True
+        for p in candidate_files:
+            try:
+                if p.stat().st_mtime > cutoff + WikiCurator._STALE_SLACK_SECONDS:
+                    return True
+            except OSError:
+                continue
+        return False
 
     @staticmethod
     def _sources_newer_than(

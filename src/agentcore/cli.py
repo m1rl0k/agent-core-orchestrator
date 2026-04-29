@@ -575,8 +575,15 @@ def _build_wiki_stack(settings, repo_root: Path):  # type: ignore[no-untyped-def
 @wiki_app.command("rebuild")
 def wiki_rebuild(
     repo: Path = typer.Argument(Path("."), help="Repo root to ingest"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-render every module page, ignoring the existing wiki state. "
+        "Default: skip pages whose sources haven't changed since last write.",
+    ),
 ) -> None:
-    """Bulk-seed module pages by reading the repo. Idempotent."""
+    """Bulk-seed module pages. Smart by default — only re-renders modules
+    whose sources have changed (or have no page yet)."""
     settings = get_settings()
     if not settings.enable_wiki:
         console.print(
@@ -587,7 +594,7 @@ def wiki_rebuild(
     _, _, curator = _build_wiki_stack(settings, repo)
 
     async def _run() -> list[str]:
-        return await curator.seed_from_repo(repo.resolve())
+        return await curator.seed_from_repo(repo.resolve(), force=force)
 
     written = asyncio.run(_run())
     if not written:

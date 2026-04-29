@@ -32,9 +32,15 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # Drop the FK on agentcore_graph_communities that references the old
-    # nodes PK (`node_id` -> agentcore_graph_nodes.id), then recreate it
-    # against the new composite key.
+    # Drop every FK that references the old nodes PK so we can replace it.
+    op.execute(
+        "ALTER TABLE agentcore_graph_edges "
+        "DROP CONSTRAINT IF EXISTS agentcore_graph_edges_source_fkey"
+    )
+    op.execute(
+        "ALTER TABLE agentcore_graph_edges "
+        "DROP CONSTRAINT IF EXISTS agentcore_graph_edges_target_fkey"
+    )
     op.execute(
         "ALTER TABLE agentcore_graph_communities "
         "DROP CONSTRAINT IF EXISTS agentcore_graph_communities_node_id_fkey"
@@ -50,10 +56,23 @@ def upgrade() -> None:
         "ADD CONSTRAINT agentcore_graph_nodes_pkey PRIMARY KEY (project_id, id)"
     )
 
-    # Recreate the communities FK pointing at the new composite key. We
-    # only re-add it if the column shape lets us — older deployments may
-    # not have a project_id column on communities; the migration tolerates
-    # that and just leaves the FK off.
+    # Recreate FKs against the new composite key. Edges and communities
+    # all gained a project_id column in 002, so the join is on
+    # (project_id, source/target/node_id) -> (project_id, id).
+    op.execute(
+        "ALTER TABLE agentcore_graph_edges "
+        "ADD CONSTRAINT agentcore_graph_edges_source_fkey "
+        "FOREIGN KEY (project_id, source) "
+        "REFERENCES agentcore_graph_nodes (project_id, id) "
+        "ON DELETE CASCADE"
+    )
+    op.execute(
+        "ALTER TABLE agentcore_graph_edges "
+        "ADD CONSTRAINT agentcore_graph_edges_target_fkey "
+        "FOREIGN KEY (project_id, target) "
+        "REFERENCES agentcore_graph_nodes (project_id, id) "
+        "ON DELETE CASCADE"
+    )
     op.execute(
         "ALTER TABLE agentcore_graph_communities "
         "ADD CONSTRAINT agentcore_graph_communities_node_id_fkey "
@@ -62,12 +81,7 @@ def upgrade() -> None:
         "ON DELETE CASCADE"
     )
 
-    # Edges: drop global unique on (source, target, relation), replace with the
-    # tenant-scoped composite. The unique constraint name varies by Postgres
-    # version; we drop by index name.
-    op.execute(
-        "DROP INDEX IF EXISTS agentcore_graph_edges_source_target_relation_key"
-    )
+    # Edges: drop global unique constraint, replace with tenant-scoped composite.
     op.execute(
         "ALTER TABLE agentcore_graph_edges "
         "DROP CONSTRAINT IF EXISTS agentcore_graph_edges_source_target_relation_key"
