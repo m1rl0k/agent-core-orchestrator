@@ -461,13 +461,49 @@ class Runtime:
 
     @staticmethod
     def _json_schema_hint(contract: Contract) -> str:
-        out_lines = []
+        """Render the output schema in a way the LLM can faithfully reproduce.
+
+        Includes every domain type's field shape inline. Without this, models
+        emit their own JSON shape (e.g. {"file_path", "changes": [...]}
+        instead of FileChange's {path, action, rationale}) and contract
+        validation rejects the response, wasting the LLM call.
+        """
+        from agentcore.contracts.domain import DOMAIN_TYPES
+
+        out_lines: list[str] = []
+        referenced: set[str] = set()
         for f in contract.outputs:
             req = "required" if f.required else "optional"
             out_lines.append(f"  - {f.name}: {f.type} ({req}) — {f.description}")
+            # Capture every domain type referenced (including list[Type] and dict[str, Type]).
+            inner = f.type
+            for prefix in ("list[", "dict[str,"):
+                if inner.startswith(prefix):
+                    inner = inner[len(prefix):].rstrip("] ").strip()
+                    break
+            if inner in DOMAIN_TYPES:
+                referenced.add(inner)
+
+        type_blocks: list[str] = []
+        for tname in sorted(referenced):
+            model = DOMAIN_TYPES[tname]
+            fields = model.model_fields
+            field_lines = []
+            for field_name, field_info in fields.items():
+                ann = field_info.annotation
+                ann_str = getattr(ann, "__name__", None) or str(ann).replace("typing.", "")
+                req_str = "required" if field_info.is_required() else "optional"
+                field_lines.append(f"    {field_name}: {ann_str} ({req_str})")
+            type_blocks.append(f"  {tname}:\n" + "\n".join(field_lines))
+
         if not out_lines:
             return ""
-        return "OUTPUT schema:\n" + "\n".join(out_lines)
+        s = "OUTPUT schema:\n" + "\n".join(out_lines)
+        if type_blocks:
+            s += "\n\nReferenced types (use EXACTLY these field names):\n" + "\n".join(
+                type_blocks
+            )
+        return s
 
     @staticmethod
     def _parse_json_block(text: str) -> dict[str, Any]:
