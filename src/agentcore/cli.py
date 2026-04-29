@@ -13,8 +13,12 @@ from rich.table import Table
 
 from agentcore.adapters.claude_code import (
     link as claude_link,
+)
+from agentcore.adapters.claude_code import (
     link_copilot_wiki,
     link_cursor_wiki,
+)
+from agentcore.adapters.claude_code import (
     link_wiki as link_claude_wiki,
 )
 from agentcore.adapters.graphify import GraphifyAdapter
@@ -510,13 +514,6 @@ def wiki_link(
     if bad:
         console.print(f"[red]unknown link target(s):[/red] {bad}")
         raise typer.Exit(code=2)
-    from agentcore.adapters.claude_code import (
-        link_copilot_wiki,
-        link_cursor_wiki,
-    )
-    from agentcore.adapters.claude_code import (
-        link_wiki as link_claude_wiki,
-    )
 
     project_root = Path(repo).resolve()
     summary: list[str] = []
