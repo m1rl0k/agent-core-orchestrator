@@ -112,6 +112,71 @@ def doctor(
 
 
 # ---------------------------------------------------------------------------
+# up / down — bring the docker-compose stack online for local dev
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def up(
+    service: str = typer.Argument(
+        "postgres",
+        help="Compose service to start (default: postgres). Pass `all` for everything.",
+    ),
+) -> None:
+    """Bring up local infra (Postgres + pgvector by default)."""
+    settings = get_settings()
+    from agentcore.state.bootstrap import (
+        _compose_file_path,
+        docker_available,
+        ensure_postgres,
+    )
+
+    if not docker_available():
+        console.print("[red]docker not found on PATH[/red]; install Docker Desktop or equivalent.")
+        raise typer.Exit(code=2)
+    if service == "postgres":
+        if ensure_postgres(settings):
+            console.print(f"[green]postgres ready[/green] at {settings.pg_host}:{settings.pg_port}")
+            return
+        console.print("[red]postgres failed to start[/red] — check `docker compose logs postgres`.")
+        raise typer.Exit(code=3)
+    # generic "all"
+    import subprocess
+
+    compose = _compose_file_path()
+    if compose is None:
+        console.print("[red]no docker-compose.yml found[/red] in cwd or any parent.")
+        raise typer.Exit(code=2)
+    rc = subprocess.run(
+        ["docker", "compose", "-f", str(compose), "up", "-d"],
+        check=False,
+    ).returncode
+    if rc != 0:
+        raise typer.Exit(code=rc)
+    console.print("[green]compose stack up[/green]")
+
+
+@app.command()
+def down() -> None:
+    """Stop the local docker-compose stack."""
+    from agentcore.state.bootstrap import _compose_file_path, docker_available
+
+    if not docker_available():
+        console.print("[red]docker not found on PATH[/red]")
+        raise typer.Exit(code=2)
+    compose = _compose_file_path()
+    if compose is None:
+        console.print("[red]no docker-compose.yml found[/red]")
+        raise typer.Exit(code=2)
+    import subprocess
+
+    rc = subprocess.run(
+        ["docker", "compose", "-f", str(compose), "down"], check=False
+    ).returncode
+    raise typer.Exit(code=rc)
+
+
+# ---------------------------------------------------------------------------
 # agents
 # ---------------------------------------------------------------------------
 
