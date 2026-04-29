@@ -205,15 +205,27 @@ async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
 
     router = LLMRouter(settings)
     traces = TraceLog()
+    import contextlib
+
     graph = KnowledgeGraph(settings=settings)
-    graph.load()
+    try:
+        graph.load()
+    except Exception as exc:
+        console.print(f"[yellow]graph degraded to memory-only ({exc})[/yellow]")
+        graph = KnowledgeGraph()
+        with contextlib.suppress(Exception):
+            graph.load()
     graphify = (
         GraphifyAdapter(repo_root=settings.graphify_repo_root, enabled=True)
         if settings.enable_graphify
         else None
     )
     # Best-effort retriever: only if pgvector + fastembed are usable.
-    retriever = _try_build_retriever(settings, graph)
+    from agentcore.retrieval.factory import try_build_retriever
+
+    retriever = try_build_retriever(settings, graph)
+    if retriever is None:
+        console.print("[yellow]retriever offline (see structured logs); plans will run without semantic context[/yellow]")
 
     runtime = Runtime(
         registry=registry, router=router, traces=traces,
@@ -352,47 +364,6 @@ def link_claude(
     console.print(f"skipped:  {result.skipped or '(none)'}")
     if result.settings_written:
         console.print("[green]wrote[/green] .claude/settings.json hooks")
-
-
-def _try_build_retriever(settings, graph):  # type: ignore[no-untyped-def]
-    """Construct a HybridRetriever only if its deps are usable on this host.
-
-    The retriever is intentionally optional: agents still get prompts and
-    operational-memory context without it. We never block a `plan` run on
-    embedding/postgres availability.
-    """
-    try:
-        from agentcore.memory.embed import Embedder
-        from agentcore.memory.vector import VectorStore
-        from agentcore.retrieval.hybrid import HybridRetriever
-
-        store = VectorStore(settings)
-        # Light probe: does the table exist?
-        try:
-            store.init_schema()
-        except Exception as exc:
-            console.print(f"[yellow]retriever offline (no pgvector): {exc}[/yellow]")
-            return None
-
-        try:
-            embedder = Embedder(settings)
-        except Exception as exc:
-            console.print(f"[yellow]retriever offline (no embedder): {exc}[/yellow]")
-            return None
-
-        reranker = None
-        if settings.enable_rerank:
-            try:
-                from agentcore.memory.rerank import Reranker
-
-                reranker = Reranker(settings)
-            except Exception:
-                reranker = None  # rerank is a nice-to-have
-
-        return HybridRetriever(embedder, store, graph=graph, reranker=reranker)
-    except Exception as exc:
-        console.print(f"[yellow]retriever offline: {exc}[/yellow]")
-        return None
 
 
 if __name__ == "__main__":  # pragma: no cover

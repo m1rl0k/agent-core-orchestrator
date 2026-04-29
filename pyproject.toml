@@ -41,13 +41,10 @@ dependencies = [
   "networkx>=3.2",
   "python-louvain>=0.16",
 
-  # Code indexing
-  "tree-sitter>=0.21",
-  "tree-sitter-languages>=1.10",
-
   # First-class code-graph: graphify (in-process Python).
   # NetworkX + Leiden + tree-sitter; same stack family we already use, so
-  # graphs compose without serialization.
+  # graphs compose without serialization. graphify owns its own tree-sitter
+  # transitive deps; we don't pin them here.
   "graphifyy>=0.1",
 
   # In-process embeddings (Nomic-1.5 via fastembed). Tiny model, no

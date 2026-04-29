@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(None, alias="ANTHROPIC_API_KEY")
     aws_region: str = Field("us-east-1", alias="AWS_REGION")
     aws_profile: str | None = Field(None, alias="AWS_PROFILE")
+    # Bedrock now supports long-lived API keys via the AWS_BEARER_TOKEN_BEDROCK
+    # env var. boto3 picks this up automatically when present in the
+    # environment, so all we do is read it here and ensure it's exported.
+    bedrock_api_key: str | None = Field(None, alias="AWS_BEARER_TOKEN_BEDROCK")
     azure_openai_api_key: str | None = Field(None, alias="AZURE_OPENAI_API_KEY")
     azure_openai_endpoint: str | None = Field(None, alias="AZURE_OPENAI_ENDPOINT")
     azure_openai_api_version: str = Field(
@@ -64,6 +68,73 @@ class Settings(BaseSettings):
     # LLM call timeout (applies to Anthropic, Azure, z.ai; boto3 owns Bedrock).
     llm_timeout_seconds: float = Field(60.0, alias="AGENTCORE_LLM_TIMEOUT_SECONDS")
     llm_max_retries: int = Field(3, alias="AGENTCORE_LLM_MAX_RETRIES")
+
+    # Provider priority — comma-separated list. The orchestrator picks the first
+    # provider in this list whose credentials are populated when an agent's
+    # declared provider is not configured. z.ai is preferred by default; flip
+    # the list if you want a different fallback order.
+    provider_priority: str = Field(
+        "zai,anthropic,bedrock,azure_openai", alias="AGENTCORE_PROVIDER_PRIORITY"
+    )
+
+    # Per-provider fallback model (used only when we resolve to a different
+    # provider than the agent declared, since model identifiers don't translate
+    # across vendors). Override per-deployment as needed.
+    default_model_anthropic: str = Field(
+        "claude-sonnet-4-6", alias="AGENTCORE_DEFAULT_MODEL_ANTHROPIC"
+    )
+    default_model_bedrock: str = Field(
+        "anthropic.claude-sonnet-4-6", alias="AGENTCORE_DEFAULT_MODEL_BEDROCK"
+    )
+    default_model_azure_openai: str = Field(
+        "gpt-4o", alias="AGENTCORE_DEFAULT_MODEL_AZURE_OPENAI"
+    )
+    default_model_zai: str = Field("glm-4.6", alias="AGENTCORE_DEFAULT_MODEL_ZAI")
+
+    # ------------------------------------------------------------------
+    # Provider-resolution helpers
+    # ------------------------------------------------------------------
+
+    def provider_has_creds(self, name: str) -> bool:
+        """True iff this provider has the env vars it needs to make a call."""
+        if name == "anthropic":
+            return bool(self.anthropic_api_key)
+        if name == "azure_openai":
+            return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
+        if name == "zai":
+            return bool(self.zai_api_key)
+        if name == "bedrock":
+            # Bedrock now supports long-lived API keys (Bearer token), and
+            # boto3 also accepts the standard AWS chain (profile / IAM / SSO).
+            # We treat any of these as a creds signal.
+            import os
+
+            return bool(
+                self.bedrock_api_key
+                or self.aws_profile
+                or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+                or os.environ.get("AWS_ACCESS_KEY_ID")
+                or os.environ.get("AWS_SESSION_TOKEN")
+            )
+        return False
+
+    def active_providers(self) -> list[str]:
+        """Configured providers, in declared priority order."""
+        order = [p.strip() for p in self.provider_priority.split(",") if p.strip()]
+        return [p for p in order if self.provider_has_creds(p)]
+
+    def preferred_provider(self) -> str | None:
+        """First configured provider in priority order, or None if none are set."""
+        active = self.active_providers()
+        return active[0] if active else None
+
+    def default_model_for(self, provider: str) -> str:
+        return {
+            "anthropic": self.default_model_anthropic,
+            "bedrock": self.default_model_bedrock,
+            "azure_openai": self.default_model_azure_openai,
+            "zai": self.default_model_zai,
+        }.get(provider, "")
 
     # ------------------------------------------------------------------
     # Optional integrations (host-credentialed). Each adapter rides on
