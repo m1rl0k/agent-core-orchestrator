@@ -148,7 +148,14 @@ async def _index_async(repo: Path, collection: str, init_schema: bool, settings)
     from agentcore.memory.code_index import CodeIndex
     from agentcore.memory.embed import Embedder
     from agentcore.memory.vector import VectorStore
+    from agentcore.state.bootstrap import ensure_postgres
 
+    if not ensure_postgres(settings):
+        console.print(
+            "[red]postgres unreachable[/red] — `agentcore index` needs pgvector.\n"
+            "  start it with [cyan]docker compose up -d postgres[/cyan]."
+        )
+        raise typer.Exit(code=2)
     store = VectorStore(settings)
     if init_schema:
         store.init_schema()
@@ -388,9 +395,28 @@ def _alembic_main(args: list[str]) -> int:
     """Invoke alembic in-process so we don't shell out to a separate binary."""
     from alembic.config import main as _alembic_run
 
+    settings = get_settings()
+    # Auto-start Postgres if it's part of the local docker-compose stack.
+    # Migrate is the first command users hit on a fresh checkout, so it
+    # absolutely shouldn't dump a SQLAlchemy traceback when PG is down.
+    from agentcore.state.bootstrap import ensure_postgres
+
+    if not ensure_postgres(settings):
+        console.print(
+            "[red]postgres unreachable[/red] at "
+            f"{settings.pg_host}:{settings.pg_port}.\n"
+            "  start it with [cyan]docker compose up -d postgres[/cyan] or "
+            "set PGHOST/PGPORT/PGUSER in your .env to a different DB."
+        )
+        return 2
+
     repo = Path(__file__).resolve().parent.parent.parent
     cfg_path = str(repo / "alembic.ini")
-    return int(_alembic_run(argv=["-c", cfg_path, *args]) or 0)
+    try:
+        return int(_alembic_run(argv=["-c", cfg_path, *args]) or 0)
+    except Exception as exc:
+        console.print(f"[red]alembic failed:[/red] {exc.__class__.__name__}: {exc}")
+        return 3
 
 
 @migrate_app.command("upgrade")
