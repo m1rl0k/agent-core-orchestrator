@@ -176,6 +176,20 @@ class Settings(BaseSettings):
     # (each with its own .env). Both modes work.
     project_name: str = Field("default", alias="AGENTCORE_PROJECT_NAME")
 
+    # ------------------------------------------------------------------
+    # Living wiki (codebase living-doc, retrieval-first)
+    # ------------------------------------------------------------------
+    # Off by default — opt in per project. When enabled, the curator agent
+    # produces and maintains a markdown wiki under `wiki_root`, indexed in
+    # pgvector under collection `wiki:<project>:<branch>` so every agent
+    # loop can retrieve from it.
+    enable_wiki: bool = Field(False, alias="AGENTCORE_ENABLE_WIKI")
+    wiki_root: Path = Field(Path(".agentcore/wiki"), alias="AGENTCORE_WIKI_ROOT")
+    # Model the curator uses for ingest + lint. Cheap + fast is the right
+    # call here since this is high-volume and the agent has well-defined
+    # output shape.
+    wiki_curator_model: str = Field("glm-4.6", alias="AGENTCORE_WIKI_CURATOR_MODEL")
+
 
 @lru_cache
 def get_settings() -> Settings:

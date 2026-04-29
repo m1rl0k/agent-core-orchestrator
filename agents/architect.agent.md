@@ -39,7 +39,7 @@ contract:
 
 # ─── Knowledge bindings ───────────────────────────────────────────────────
 knowledge:
-  rag_collections: [code, docs, decisions]
+  rag_collections: [code, docs, decisions, wiki]
   graph_communities: [architecture, dependencies]
   code_scopes: ["**/*"]
 ---

@@ -11,7 +11,12 @@ import uvicorn
 from rich.console import Console
 from rich.table import Table
 
-from agentcore.adapters.claude_code import link as claude_link
+from agentcore.adapters.claude_code import (
+    link as claude_link,
+    link_copilot_wiki,
+    link_cursor_wiki,
+    link_wiki as link_claude_wiki,
+)
 from agentcore.adapters.graphify import GraphifyAdapter
 from agentcore.capabilities import detect_capabilities
 from agentcore.contracts.envelopes import Handoff, new_task_id
@@ -364,6 +369,230 @@ def link_claude(
     console.print(f"skipped:  {result.skipped or '(none)'}")
     if result.settings_written:
         console.print("[green]wrote[/green] .claude/settings.json hooks")
+
+
+# ---------------------------------------------------------------------------
+# wiki — living codebase wiki (curated by the wikist agent, indexed in pgvector)
+# ---------------------------------------------------------------------------
+
+
+wiki_app = typer.Typer(help="Living codebase wiki: seed, search, link, install-hook")
+app.add_typer(wiki_app, name="wiki")
+
+
+def _resolve_branch(repo_root: Path) -> str:
+    """Best-effort current-branch detection. Falls back to 'default'."""
+    from agentcore.adapters.git_local import GitAdapter
+
+    try:
+        b = GitAdapter(repo_root=repo_root).current_branch()
+        return b or "default"
+    except Exception:
+        return "default"
+
+
+def _build_wiki_stack(settings, repo_root: Path):  # type: ignore[no-untyped-def]
+    """Wire WikiStorage + WikiIndex + WikiCurator from current settings."""
+    from agentcore.llm.router import LLMRouter
+    from agentcore.wiki.curator import WikiCurator
+    from agentcore.wiki.index import WikiIndex
+    from agentcore.wiki.storage import WikiStorage
+
+    branch = _resolve_branch(repo_root)
+    storage = WikiStorage(settings.wiki_root, settings.project_name, branch)
+
+    embedder = None
+    vector = None
+    try:
+        from agentcore.memory.embed import Embedder
+        from agentcore.memory.vector import VectorStore
+
+        v = VectorStore(settings)
+        try:
+            v.init_schema()
+            vector = v
+            embedder = Embedder(settings)
+        except Exception as exc:
+            console.print(
+                f"[yellow]wiki retrieval offline (pgvector/embedder unavailable: {exc}); "
+                "pages will be written to disk only[/yellow]"
+            )
+    except Exception:
+        pass
+
+    index = WikiIndex(storage, embedder, vector)
+    router = LLMRouter(settings)
+    curator = WikiCurator(
+        router,
+        storage,
+        index,
+        curator_model=settings.wiki_curator_model,
+    )
+    return storage, index, curator
+
+
+@wiki_app.command("rebuild")
+def wiki_rebuild(
+    repo: Path = typer.Argument(Path("."), help="Repo root to ingest"),
+) -> None:
+    """Bulk-seed module pages by reading the repo. Idempotent."""
+    settings = get_settings()
+    if not settings.enable_wiki:
+        console.print(
+            "[yellow]wiki disabled[/yellow] — set AGENTCORE_ENABLE_WIKI=true in .env to enable."
+        )
+        raise typer.Exit(code=1)
+    configure_logging(settings.log_level)
+    _, _, curator = _build_wiki_stack(settings, repo)
+
+    async def _run() -> list[str]:
+        return await curator.seed_from_repo(repo.resolve())
+
+    written = asyncio.run(_run())
+    if not written:
+        console.print("[yellow]no pages produced[/yellow] — check that the repo has source files.")
+        return
+    console.print(f"[green]wrote {len(written)} page(s):[/green]")
+    for r in written:
+        console.print(f"  · {r}")
+
+
+@wiki_app.command("search")
+def wiki_search(
+    query: str = typer.Argument(..., help="Natural-language query"),
+    repo: Path = typer.Option(Path("."), help="Repo root (resolves project + branch)"),
+    k: int = typer.Option(8, help="Top-k hits"),
+) -> None:
+    """Semantic search over the wiki for this project + branch."""
+    settings = get_settings()
+    if not settings.enable_wiki:
+        console.print(
+            "[yellow]wiki disabled[/yellow] — set AGENTCORE_ENABLE_WIKI=true to enable."
+        )
+        raise typer.Exit(code=1)
+    _, index, _ = _build_wiki_stack(settings, repo)
+    if not index.is_ready:
+        console.print(
+            "[yellow]wiki search needs pgvector + the embedder; neither is available right now.[/yellow]"
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> list:
+        return await index.search(query, k=k)
+
+    hits = asyncio.run(_run())
+    if not hits:
+        console.print("[yellow]no hits[/yellow]")
+        return
+    table = Table("rel", "title", "score", "excerpt")
+    for h in hits:
+        excerpt = (h.excerpt or "")[:120].replace("\n", " ")
+        table.add_row(h.rel, h.title, f"{h.score:.2f}", excerpt)
+    console.print(table)
+
+
+@wiki_app.command("link")
+def wiki_link(
+    tool: str = typer.Argument("all", help="claude | copilot | cursor | all"),
+    repo: Path = typer.Option(Path("."), help="Repo root"),
+) -> None:
+    """Mirror the wiki into another tool's expected location."""
+    settings = get_settings()
+    if not settings.enable_wiki:
+        console.print(
+            "[yellow]wiki disabled[/yellow] — set AGENTCORE_ENABLE_WIKI=true to enable."
+        )
+        raise typer.Exit(code=1)
+    storage, _, _ = _build_wiki_stack(settings, repo)
+    targets = ("claude", "copilot", "cursor") if tool == "all" else (tool,)
+    valid = {"claude", "copilot", "cursor"}
+    bad = [t for t in targets if t not in valid]
+    if bad:
+        console.print(f"[red]unknown link target(s):[/red] {bad}")
+        raise typer.Exit(code=2)
+    from agentcore.adapters.claude_code import (
+        link_copilot_wiki,
+        link_cursor_wiki,
+    )
+    from agentcore.adapters.claude_code import (
+        link_wiki as link_claude_wiki,
+    )
+
+    project_root = Path(repo).resolve()
+    summary: list[str] = []
+    if "claude" in targets:
+        n = link_claude_wiki(project_root, storage)
+        summary.append(f"claude: {n} skill page(s)")
+    if "copilot" in targets:
+        n = link_copilot_wiki(project_root, storage)
+        summary.append(f"copilot: {n} prompt(s)")
+    if "cursor" in targets:
+        ok = link_cursor_wiki(project_root, storage)
+        summary.append(f"cursor: {'wrote rules' if ok else 'no-op'}")
+    for line in summary:
+        console.print(f"  · {line}")
+
+
+@wiki_app.command("install-hook")
+def wiki_install_hook(
+    repo: Path = typer.Option(Path("."), help="Repo root"),
+) -> None:
+    """Install a git post-commit hook that POSTs changed paths to /wiki/refresh.
+
+    Cross-platform: writes a Python hook so it works the same on POSIX and
+    Windows. Git on Windows uses Git Bash to dispatch hooks; both shells
+    can run `python` directly. We avoid bash-isms (chmod, tr, sed) so
+    nothing is OS-specific in the script itself.
+    """
+    import os
+    import stat
+
+    repo_root = Path(repo).resolve()
+    git_dir = repo_root / ".git"
+    if not git_dir.is_dir():
+        console.print("[yellow]not a git repo — nothing to install[/yellow]")
+        raise typer.Exit(code=1)
+    hook = git_dir / "hooks" / "post-commit"
+    settings = get_settings()
+    # Inline a tiny Python script; works identically on POSIX + Windows.
+    body = f'''#!/usr/bin/env python3
+"""Auto-installed by `agentcore wiki install-hook`. Cross-platform."""
+import json, os, subprocess, sys, urllib.request
+
+URL = os.environ.get("AGENTCORE_URL", "http://{settings.host}:{settings.port}") + "/wiki/refresh"
+TOKEN = os.environ.get("AGENTCORE_API_TOKEN")
+
+def _run(*args):
+    return subprocess.run(args, capture_output=True, text=True, check=False).stdout.strip()
+
+sha = _run("git", "rev-parse", "HEAD")
+out = _run("git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")
+paths = [p for p in out.splitlines() if p]
+if not paths:
+    sys.exit(0)
+payload = json.dumps({{"commit_sha": sha, "changed_paths": paths}}).encode("utf-8")
+req = urllib.request.Request(
+    URL,
+    data=payload,
+    headers={{"Content-Type": "application/json"}},
+    method="POST",
+)
+if TOKEN:
+    req.add_header("Authorization", f"Bearer {{TOKEN}}")
+try:
+    with urllib.request.urlopen(req, timeout=5) as _:
+        pass
+except Exception:
+    # Hook is fire-and-forget; never fail a commit because the wiki was offline.
+    pass
+'''
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(body, encoding="utf-8")
+    # Mark executable on POSIX. On Windows chmod is a no-op and Git uses the
+    # file extension / shebang to dispatch, so this is safe to skip there.
+    if os.name == "posix":
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    console.print(f"[green]installed[/green] {hook}")
 
 
 if __name__ == "__main__":  # pragma: no cover

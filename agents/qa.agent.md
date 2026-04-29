@@ -34,7 +34,7 @@ contract:
   sla_seconds: 600
 
 knowledge:
-  rag_collections: [code]
+  rag_collections: [code, wiki]
   graph_communities: [dependencies]
   code_scopes: ["**/*"]
 ---

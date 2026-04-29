@@ -172,6 +172,19 @@ class VectorStore:
             cur.execute("DELETE FROM agentcore_chunks WHERE collection = %s", (collection,))
             return cur.rowcount
 
+    def delete_by_ref(self, collection: str, ref: str) -> int:
+        """Remove a single chunk by its (collection, ref) identity.
+
+        Used by the wiki indexer when a page is deleted on disk so its
+        embedding doesn't keep showing up in retrieval.
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM agentcore_chunks WHERE collection = %s AND ref = %s",
+                (collection, ref),
+            )
+            return cur.rowcount
+
     def close(self) -> None:
         if self._pool is not None:
             self._pool.close()

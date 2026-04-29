@@ -17,7 +17,8 @@ import hmac
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+import structlog
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 from agentcore.adapters.graphify import GraphifyAdapter
@@ -32,6 +33,8 @@ from agentcore.orchestrator.runtime import HandoffRejected, Runtime
 from agentcore.orchestrator.traces import TraceLog
 from agentcore.settings import get_settings
 from agentcore.spec.loader import AgentRegistry, watch_agents_dir
+
+log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Wire payloads
@@ -247,7 +250,146 @@ def build_app() -> FastAPI:
             ],
         }
 
+    # ----------------------------------------------------------------
+    # Wiki endpoints — registered only when AGENTCORE_ENABLE_WIKI=true
+    # so the disabled mode keeps the surface minimal.
+    # ----------------------------------------------------------------
+    if settings.enable_wiki:
+        _register_wiki_routes(app, settings, router, require_api_token)
+
     return app
+
+
+def _register_wiki_routes(  # type: ignore[no-untyped-def]
+    app: FastAPI, settings, router, require_api_token
+) -> None:
+    """Wire the living-wiki endpoints. Off-by-default; only invoked from
+    `build_app` when `AGENTCORE_ENABLE_WIKI=true`."""
+    import contextlib
+
+    from agentcore.adapters.git_local import GitAdapter
+    from agentcore.wiki.curator import WikiCurator
+    from agentcore.wiki.index import WikiIndex
+    from agentcore.wiki.storage import WikiStorage
+
+    branch = "default"
+    with contextlib.suppress(Exception):
+        b = GitAdapter(repo_root=settings.graphify_repo_root).current_branch()
+        if b:
+            branch = b
+    storage = WikiStorage(settings.wiki_root, settings.project_name, branch)
+
+    embedder = None
+    vector = None
+    with contextlib.suppress(Exception):
+        from agentcore.memory.embed import Embedder
+        from agentcore.memory.vector import VectorStore
+
+        v = VectorStore(settings)
+        with contextlib.suppress(Exception):
+            v.init_schema()
+            vector = v
+            embedder = Embedder(settings)
+    index = WikiIndex(storage, embedder, vector)
+    curator = WikiCurator(
+        router, storage, index, curator_model=settings.wiki_curator_model
+    )
+
+    # Stale-index startup warning. Pure / fast / no LLM calls; gives the
+    # operator an immediate "your wiki is N pages behind the source" signal.
+    with contextlib.suppress(Exception):
+        report = curator.lint(settings.graphify_repo_root)
+        if report.orphans or report.stale or report.missing_coverage:
+            log.warning(
+                "wiki.index_stale",
+                orphans=len(report.orphans),
+                stale=len(report.stale),
+                missing_coverage=len(report.missing_coverage),
+                hint="run `agentcore wiki rebuild` or POST /wiki/refresh to refresh",
+            )
+
+    class WikiRefreshIn(BaseModel):
+        commit_sha: str | None = None
+        changed_paths: list[str] = []
+        mode: str = "incremental"  # "incremental" | "seed" | "lint"
+
+    @app.get("/wiki")
+    async def wiki_index() -> dict[str, Any]:
+        pages = [
+            {"rel": p.rel, "title": p.title, "sources": p.sources}
+            for p in storage.walk()
+        ]
+        return {
+            "project": storage.project,
+            "branch": storage.branch,
+            "root": str(storage.root),
+            "count": len(pages),
+            "pages": pages,
+        }
+
+    @app.get("/wiki/search")
+    async def wiki_search(q: str, k: int = 8) -> dict[str, Any]:
+        if not index.is_ready:
+            raise HTTPException(status_code=503, detail="wiki retrieval unavailable")
+        hits = await index.search(q, k=k)
+        return {
+            "query": q,
+            "hits": [
+                {"rel": h.rel, "title": h.title, "score": h.score, "excerpt": h.excerpt}
+                for h in hits
+            ],
+        }
+
+    @app.get("/wiki/{path:path}")
+    async def wiki_page(path: str) -> dict[str, Any]:
+        page = storage.read(path)
+        if page is None:
+            raise HTTPException(status_code=404, detail=f"no wiki page at {path!r}")
+        return {
+            "rel": page.rel,
+            "title": page.title,
+            "frontmatter": page.frontmatter,
+            "body": page.body,
+        }
+
+    async def _curator_seed(commit_sha: str | None) -> None:
+        try:
+            await curator.seed_from_repo(settings.graphify_repo_root, commit_sha=commit_sha)
+        except Exception as exc:
+            log.warning("wiki.bg_seed_failed", error=str(exc))
+
+    async def _curator_incremental(paths: list[str], commit_sha: str | None) -> None:
+        try:
+            await curator.incremental(
+                paths, settings.graphify_repo_root, commit_sha=commit_sha
+            )
+        except Exception as exc:
+            log.warning("wiki.bg_incremental_failed", error=str(exc))
+
+    @app.post("/wiki/refresh", dependencies=[Depends(require_api_token)], status_code=202)
+    async def wiki_refresh(
+        req: WikiRefreshIn, background: BackgroundTasks
+    ) -> dict[str, Any]:
+        """Enqueue a wiki refresh. Returns 202 immediately; curator runs
+        off-thread so git hooks / webhooks aren't blocked on the LLM call.
+        Lint mode is cheap and stays inline."""
+        repo = settings.graphify_repo_root
+        if req.mode == "lint":
+            report = curator.lint(repo)
+            return {
+                "mode": "lint",
+                "orphans": report.orphans,
+                "stale": report.stale,
+                "missing_coverage": report.missing_coverage,
+            }
+        if req.mode == "seed":
+            background.add_task(_curator_seed, req.commit_sha)
+            return {"mode": "seed", "status": "queued"}
+        # default: incremental
+        background.add_task(
+            _curator_incremental, list(req.changed_paths), req.commit_sha
+        )
+        return {"mode": "incremental", "status": "queued"}
 
 
 app = build_app()

@@ -36,7 +36,7 @@ contract:
   sla_seconds: 300
 
 knowledge:
-  rag_collections: [code, decisions]
+  rag_collections: [code, decisions, wiki]
   graph_communities: [pipelines, dependencies]
   code_scopes: [".github/**", "ci/**", "infra/**", "Dockerfile", "docker-compose.yml"]
 ---
