@@ -150,9 +150,19 @@ class KnowledgeGraph:
         self,
         snapshot_path: Path | str = ".agentcore/graph.json",
         settings: Settings | None = None,
+        *,
+        project_id: str | None = None,
     ) -> None:
         self.path = Path(snapshot_path)
         self.settings = settings
+        # Tenant boundary. When `project_id` isn't set explicitly, fall
+        # back to settings.project_name. Graph mutations stamp this on
+        # every row so multi-tenant deployments stay isolated; load() and
+        # operational_memory() filter by it too.
+        self.project_id = (
+            project_id if project_id is not None
+            else (settings.project_name if settings else "default")
+        )
         self.g: nx.Graph = nx.Graph()
         self._communities: dict[str, int] = {}
 
@@ -196,11 +206,15 @@ class KnowledgeGraph:
                 )
             return
         sql = """
-        INSERT INTO agentcore_graph_events (task_id, actor, action, subject, attrs)
-        VALUES (%s, %s, %s, %s, %s::jsonb)
+        INSERT INTO agentcore_graph_events
+          (project_id, task_id, actor, action, subject, attrs)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
         """
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, (task_id, actor, action, subject, json.dumps(attrs)))
+            cur.execute(
+                sql,
+                (self.project_id, task_id, actor, action, subject, json.dumps(attrs)),
+            )
 
     # ---- generic mutation ----------------------------------------------
 
@@ -221,9 +235,9 @@ class KnowledgeGraph:
         clean_attrs = {k: v for k, v in attrs.items() if k != "labels"}
         kind = str(clean_attrs.get("kind") or self._infer_kind(node))
         sql = """
-        INSERT INTO agentcore_graph_nodes (id, kind, attrs, labels)
-        VALUES (%s, %s, %s::jsonb, %s::jsonb)
-        ON CONFLICT (id) DO UPDATE SET
+        INSERT INTO agentcore_graph_nodes (project_id, id, kind, attrs, labels)
+        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
+        ON CONFLICT (project_id, id) DO UPDATE SET
           kind = EXCLUDED.kind,
           attrs = agentcore_graph_nodes.attrs || EXCLUDED.attrs,
           labels = agentcore_graph_nodes.labels || EXCLUDED.labels,
@@ -231,7 +245,10 @@ class KnowledgeGraph:
           updated_at = now()
         """
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, (node, kind, json.dumps(clean_attrs), json.dumps(labels)))
+            cur.execute(
+                sql,
+                (self.project_id, node, kind, json.dumps(clean_attrs), json.dumps(labels)),
+            )
 
     def _persist_edge(self, u: str, v: str, weight: float, attrs: dict[str, Any]) -> None:
         if not self.is_persistent:
@@ -240,9 +257,9 @@ class KnowledgeGraph:
         clean_attrs = {k: val for k, val in attrs.items() if k != "relation"}
         sql = """
         INSERT INTO agentcore_graph_edges
-          (source, target, relation, weight, active_weight, evidence_count, attrs)
-        VALUES (%s, %s, %s, %s, %s, 1, %s::jsonb)
-        ON CONFLICT (source, target, relation) DO UPDATE SET
+          (project_id, source, target, relation, weight, active_weight, evidence_count, attrs)
+        VALUES (%s, %s, %s, %s, %s, %s, 1, %s::jsonb)
+        ON CONFLICT (project_id, source, target, relation) DO UPDATE SET
           weight = agentcore_graph_edges.weight + EXCLUDED.weight,
           active_weight = agentcore_graph_edges.weight + EXCLUDED.weight,
           evidence_count = agentcore_graph_edges.evidence_count + 1,
@@ -251,7 +268,10 @@ class KnowledgeGraph:
           updated_at = now()
         """
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(sql, (u, v, relation, weight, weight, json.dumps(clean_attrs)))
+            cur.execute(
+                sql,
+                (self.project_id, u, v, relation, weight, weight, json.dumps(clean_attrs)),
+            )
 
     def add_node(self, node: str, **attrs: Any) -> None:
         merged = dict(self.g.nodes[node]) if node in self.g else {}
