@@ -70,6 +70,18 @@ def _load_rules(path: Path) -> str:
     return text
 
 log = structlog.get_logger(__name__)
+_TRACE_PROJECT_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agentcore_trace_project_id", default=None
+)
+
+
+def set_trace_project(project_id: str | None) -> contextvars.Token[str | None]:
+    """Scope trace persistence for the current async task."""
+    return _TRACE_PROJECT_ID.set(project_id)
+
+
+def reset_trace_project(token: contextvars.Token[str | None]) -> None:
+    _TRACE_PROJECT_ID.reset(token)
 
 
 class HandoffRejected(RuntimeError):
@@ -990,7 +1002,14 @@ class Runtime:
     def _record(
         self, task_id: str, step: int, kind: str, actor: str, detail: dict[str, Any]
     ) -> None:
-        self.traces.record(TraceEvent(
-            task_id=task_id, step=step, kind=kind, actor=actor, detail=detail  # type: ignore[arg-type]
-        ))
+        self.traces.record(
+            TraceEvent(
+                task_id=task_id,
+                step=step,
+                kind=kind,  # type: ignore[arg-type]
+                actor=actor,
+                detail=detail,
+            ),
+            project_id=_TRACE_PROJECT_ID.get(),
+        )
         log.info("trace", task_id=task_id, step=step, kind=kind, actor=actor, **detail)
