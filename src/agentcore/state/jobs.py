@@ -24,10 +24,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import psycopg
 import structlog
 
 from agentcore.settings import Settings, get_settings
+from agentcore.state.db import pg_conn
 
 log = structlog.get_logger(__name__)
 
@@ -88,7 +88,7 @@ class JobQueue:
     def init_schema(self) -> bool:
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(DDL)
@@ -142,7 +142,7 @@ class JobQueue:
         created_by: str | None,
     ) -> int:
         with (
-            psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(self.settings) as conn,
             conn.cursor() as cur,
         ):
             # ON CONFLICT honours the partial unique index on
@@ -266,7 +266,7 @@ class JobQueue:
          RETURNING j.id, j.kind, j.payload, j.attempts, j.max_attempts;
         """
         with (
-            psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(self.settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(sql, params)
@@ -306,7 +306,7 @@ class JobQueue:
             return False
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -330,7 +330,7 @@ class JobQueue:
             return
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -390,7 +390,7 @@ class JobQueue:
         self, job_id: int, status: str, *, error: str | None
     ) -> None:
         with (
-            psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(self.settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(
@@ -411,7 +411,7 @@ class JobQueue:
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -438,7 +438,7 @@ class JobQueue:
         pid = project_id or self.settings.project_name
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -479,7 +479,7 @@ class JobQueue:
         pid = project_id or self.settings.project_name
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 if older_than_days is None:
@@ -515,7 +515,7 @@ class JobQueue:
         pid = project_id or self.settings.project_name
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -553,7 +553,7 @@ class JobQueue:
         pid = project_id or self.settings.project_name
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(

@@ -114,9 +114,10 @@ class WikiCurator:
             page = await self._render_module_page(module, files, repo_root)
             if page is None:
                 continue
-            if self.storage.write(page, commit_sha=commit_sha):
-                await self.index.upsert_page(page)
-                written.append(page.rel)
+            written_page = self.storage.write(page, commit_sha=commit_sha)
+            if written_page is not None:
+                await self.index.upsert_page(written_page)
+                written.append(written_page.rel)
         if skipped_unchanged:
             log.info(
                 "wiki.seed_skipped_unchanged",
@@ -125,9 +126,10 @@ class WikiCurator:
             )
         # Always (re)write the index page after a seed — it summarises what's there.
         idx = self._render_index_page()
-        if self.storage.write(idx, commit_sha=commit_sha):
-            await self.index.upsert_page(idx)
-            written.append(idx.rel)
+        written_idx = self.storage.write(idx, commit_sha=commit_sha)
+        if written_idx is not None:
+            await self.index.upsert_page(written_idx)
+            written.append(written_idx.rel)
         return written
 
     # ---- mode 2: incremental -----------------------------------------
@@ -161,9 +163,10 @@ class WikiCurator:
             new_page = WikiPage(
                 rel=page.rel, frontmatter=dict(page.frontmatter), body=new_body
             )
-            if self.storage.write(new_page, commit_sha=commit_sha):
-                await self.index.upsert_page(new_page)
-                written.append(new_page.rel)
+            written_page = self.storage.write(new_page, commit_sha=commit_sha)
+            if written_page is not None:
+                await self.index.upsert_page(written_page)
+                written.append(written_page.rel)
         return written
 
     # ---- mode 3: lint -------------------------------------------------
@@ -180,6 +183,14 @@ class WikiCurator:
                 missing = [s for s in sources if not (repo / s).exists()]
                 if missing and len(missing) == len(sources):
                     report.orphans.append(page.rel)
+                    continue
+                if missing:
+                    # Partial orphan: at least one source still exists,
+                    # but others are gone. Surface as stale so the
+                    # curator regenerates the page from the surviving
+                    # subset instead of silently retaining content
+                    # describing deleted files.
+                    report.stale.append(page.rel)
                     continue
                 last_updated = page.frontmatter.get("last_updated")
                 if last_updated and self._sources_newer_than(repo, sources, last_updated):
@@ -418,13 +429,18 @@ class WikiCurator:
         )
 
     def _append_log(self, lines: list[str]) -> None:
-        """Append findings to log.md, creating it if needed."""
+        """Append findings to log.md, creating it if needed.
+
+        Append-mode write so concurrent lint passes (post-commit hook +
+        scheduled scan) cannot overwrite each other's lines via
+        read-modify-write.
+        """
         log_path = self.storage.page_path("log.md")
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = ""
-        if log_path.exists():
-            existing = log_path.read_text(encoding="utf-8")
-        if not existing:
-            existing = "---\ntitle: changelog\nstatus: stable\n---\n\n# Wiki changelog\n\n"
-        existing += "\n".join(lines) + "\n"
-        log_path.write_text(existing, encoding="utf-8")
+        if not log_path.exists():
+            log_path.write_text(
+                "---\ntitle: changelog\nstatus: stable\n---\n\n# Wiki changelog\n\n",
+                encoding="utf-8",
+            )
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")

@@ -29,7 +29,7 @@ def test_write_creates_page_with_audit_fields(tmp_path: Path) -> None:
         body="Foo summary.",
     )
     changed = s.write(page, commit_sha="abc1234")
-    assert changed is True
+    assert changed is not None
     on_disk = s.read("modules/foo.md")
     assert on_disk is not None
     assert on_disk.title == "foo"
@@ -46,9 +46,9 @@ def test_write_is_idempotent_on_unchanged_content(tmp_path: Path) -> None:
         frontmatter={"title": "foo", "sources": ["src/foo.py"]},
         body="Foo summary.",
     )
-    assert s.write(page, commit_sha="abc1234") is True
+    assert s.write(page, commit_sha="abc1234") is not None
     # Same body + sources → hash-skip; should be a no-op.
-    assert s.write(page, commit_sha="abc1234") is False
+    assert s.write(page, commit_sha="abc1234") is None
 
 
 def test_write_changes_when_body_changes(tmp_path: Path) -> None:
@@ -56,7 +56,7 @@ def test_write_changes_when_body_changes(tmp_path: Path) -> None:
     base = WikiPage(rel="x.md", frontmatter={"sources": ["a.py"]}, body="v1")
     s.write(base)
     revised = WikiPage(rel="x.md", frontmatter={"sources": ["a.py"]}, body="v2")
-    assert s.write(revised) is True
+    assert s.write(revised) is not None
 
 
 def test_frontmatter_merge_preserves_existing_sources(tmp_path: Path) -> None:

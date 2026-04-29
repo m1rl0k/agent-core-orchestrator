@@ -169,10 +169,29 @@ class Runtime:
                     label = (
                         entry.name if hasattr(entry, "name") else str(entry)
                     )
+                    # Surface the executed command + exit code in the trace
+                    # so `agentcore tail` and the UI can show what actually
+                    # ran (not just that something ran).
+                    detail: dict[str, Any] = {
+                        "name": label,
+                        "fields": list(merged.keys()),
+                    }
+                    for k, v in merged.items():
+                        if isinstance(v, dict):
+                            cmd = v.get("command")
+                            exit_code = v.get("exit_code")
+                            status = v.get("executor_status")
+                            if cmd is not None or exit_code is not None:
+                                detail[k] = {
+                                    "command": cmd,
+                                    "exit_code": exit_code,
+                                    "executor_status": status,
+                                    "stdout_tail": (v.get("stdout_tail") or "")[-500:],
+                                    "stderr_tail": (v.get("stderr_tail") or "")[-500:],
+                                }
                     self._record(
                         handoff.task_id, handoff.step, "executor",
-                        spec.name,
-                        {"name": label, "fields": list(merged.keys())},
+                        spec.name, detail,
                     )
         if new_payload != handoff.payload:
             handoff = handoff.model_copy(update={"payload": new_payload})

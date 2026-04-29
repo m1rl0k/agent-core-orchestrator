@@ -13,7 +13,13 @@ llm:
   provider: bedrock
   model: moonshot.kimi-k2-thinking
   temperature: 0.2
-  max_tokens: 1500
+  # kimi-k2-thinking emits a `<think>` block before its JSON answer; the
+  # router strips it but the model still spends thousands of tokens on
+  # reasoning. 1500 truncates mid-thought and the JSON output gets cut,
+  # making `pages_written` parse as empty and silently dropping wiki
+  # updates. 32K matches the curator-direct-call budget and the
+  # project's captured guidance in feedback_wiki_scaling.md.
+  max_tokens: 32000
 
 # ─── SOUL: persona ────────────────────────────────────────────────────────
 soul:

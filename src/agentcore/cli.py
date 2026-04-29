@@ -382,8 +382,10 @@ async def _plan_async_body(
     from agentcore.memory import prf
     from agentcore.memory.graph import KnowledgeGraph
 
+    from datetime import UTC, datetime as _dt
     settings = get_settings()
     configure_logging(settings.log_level)
+    chain_started_at = _dt.now(UTC)
 
     # Make the repo path visible to runtime executors (e.g. the polyglot
     # `tests` runner needs to know which repo to clone into a worktree).
@@ -618,6 +620,63 @@ async def _plan_async_body(
             converged = True
 
     graph.save()
+
+    # Persist a row in agentcore_jobs so the jobs dashboard shows
+    # CLI-driven chains (HTTP /run already surfaces — CLI used to be
+    # invisible). We INSERT in a terminal status (`done`/`failed`) so
+    # the worker loop ignores it. Best-effort: skip silently when
+    # Postgres is offline or psycopg isn't available.
+    with contextlib.suppress(Exception):
+        import psycopg
+        from datetime import UTC, datetime as _dt2
+        chain_finished_at = _dt2.now(UTC)
+        chain_status = "done" if converged else "failed"
+        chain_payload = {
+            "chain_id": task_id,
+            "brief": brief[:1000],
+            "repo": str(repo_abs),
+            "applied_count": len(applied),
+            "applied_files": applied[:50],
+            "review_rounds": len(verdicts),
+            "pr_url": pr_url,
+        }
+        chain_error = None
+        if not converged and verdicts:
+            blockers: list[str] = []
+            for v in verdicts:
+                if not v.get("approved"):
+                    for b in v.get("blockers") or []:
+                        if isinstance(b, dict):
+                            blockers.append(b.get("issue") or b.get("name") or "rejected")
+                        else:
+                            blockers.append(str(b))
+            chain_error = "; ".join(blockers[:5])[:500] or "rejected by review"
+        with (
+            psycopg.connect(settings.pg_dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute(
+                """
+                INSERT INTO agentcore_jobs
+                  (project_id, kind, status, payload, idempotency_key,
+                   priority, run_after, max_attempts, created_by,
+                   started_at, finished_at, error)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, kind, idempotency_key)
+                  WHERE idempotency_key IS NOT NULL
+                DO UPDATE SET
+                  status = EXCLUDED.status,
+                  payload = EXCLUDED.payload,
+                  finished_at = EXCLUDED.finished_at,
+                  error = EXCLUDED.error
+                """,
+                (
+                    settings.project_name, "chain.cli", chain_status,
+                    json.dumps(chain_payload),
+                    f"chain:{task_id}", 0, chain_started_at, 1, "cli.plan",
+                    chain_started_at, chain_finished_at, chain_error,
+                ),
+            )
 
     # Living-wiki maintenance — runs inline against the chain's repo so
     # the wiki actually exists for projects that have never been seeded.

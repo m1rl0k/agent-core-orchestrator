@@ -185,14 +185,22 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 async def _with_retry(settings: Settings, call):  # type: ignore[no-untyped-def]
-    """Call `call()` with bounded retries on transient errors."""
+    """Call `call()` with bounded retries on transient errors.
+
+    Catches `Exception`, not `BaseException`, so cancellation
+    (`asyncio.CancelledError`) and operator interrupts
+    (`KeyboardInterrupt`, `SystemExit`) propagate unmodified — the
+    retry helper has nothing useful to do with them and intercepting
+    them can leave the surrounding semaphore acquired under task-group
+    cancellation.
+    """
     attempts = max(1, int(settings.llm_max_retries))
     delay = 0.5
-    last_exc: BaseException | None = None
+    last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
             return await call()
-        except BaseException as exc:
+        except Exception as exc:
             last_exc = exc
             if not _is_retryable(exc) or attempt == attempts - 1:
                 raise

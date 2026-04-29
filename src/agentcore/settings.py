@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,12 +39,15 @@ class Settings(BaseSettings):
     pg_port: int = Field(5432, alias="PGPORT")
     pg_database: str = Field("agentcore", alias="PGDATABASE")
     pg_user: str = Field("agentcore", alias="PGUSER")
-    pg_password: str = Field("agentcore", alias="PGPASSWORD")
+    pg_password: SecretStr = Field(SecretStr("agentcore"), alias="PGPASSWORD")
 
     @property
     def pg_dsn(self) -> str:
+        # `SecretStr` masks the password in repr/str/log output by default.
+        # Only the live DSN unwraps it; everything else (tracebacks, debug
+        # dumps, structured-log model-dumps) sees `**********`.
         return (
-            f"postgresql://{self.pg_user}:{self.pg_password}"
+            f"postgresql://{self.pg_user}:{self.pg_password.get_secret_value()}"
             f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
         )
 

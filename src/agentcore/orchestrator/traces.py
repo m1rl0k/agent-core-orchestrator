@@ -18,10 +18,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import psycopg
 import structlog
 
 from agentcore.settings import Settings
+from agentcore.state.db import pg_conn
 
 log = structlog.get_logger(__name__)
 

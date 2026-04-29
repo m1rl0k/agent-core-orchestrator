@@ -38,10 +38,10 @@ from pathlib import Path
 from typing import Any
 
 import frontmatter
-import psycopg
 import structlog
 
 from agentcore.settings import Settings
+from agentcore.state.db import pg_conn
 
 log = structlog.get_logger(__name__)
 
@@ -150,7 +150,7 @@ class WikiStorage:
             return False
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(DDL)
@@ -204,7 +204,7 @@ class WikiStorage:
             return None
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -251,7 +251,7 @@ class WikiStorage:
             return
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -277,11 +277,18 @@ class WikiStorage:
 
     # ---- write --------------------------------------------------------
 
-    def write(self, page: WikiPage, *, commit_sha: str | None = None) -> bool:
-        """Atomic write of `page`. Returns True iff the on-disk content changed.
+    def write(
+        self, page: WikiPage, *, commit_sha: str | None = None
+    ) -> WikiPage | None:
+        """Atomic write of `page`. Returns the materialized `WikiPage` (with
+        merged frontmatter and refreshed audit fields) when the on-disk
+        content changed, or `None` when the hash matched and the write was
+        a no-op. Truthy/falsy semantics still distinguish change from no-op.
 
-        The new page's `content_hash` is computed and stored in frontmatter.
-        If the existing page has the same hash, this is a no-op.
+        Callers indexing the page in a vector store MUST pass the returned
+        page (not the input) to keep disk/PG/index aligned: the merged
+        page may carry unioned `sources[]` and a fresh `content_hash` that
+        the input doesn't.
         """
         # Merge with any existing frontmatter so we preserve audit fields.
         existing = self.read(page.rel)
@@ -299,7 +306,7 @@ class WikiStorage:
             # Still mirror to Postgres so a disk-only page backfills on the
             # next no-op curator write.
             self._write_pg(new)
-            return False
+            return None
 
         target = self.page_path(new.rel)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -320,14 +327,14 @@ class WikiStorage:
                 os.unlink(tmp_path)
             raise
         self._write_pg(new)
-        return True
+        return new
 
     def _write_pg(self, page: WikiPage) -> None:
         if not self._persistent or self.settings is None:
             return
         with suppress(Exception):
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -369,7 +376,7 @@ class WikiStorage:
             return False
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(

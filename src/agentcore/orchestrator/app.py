@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -507,7 +508,21 @@ def build_app() -> FastAPI:
         # later via GET /chains/{chain_id}. Survives restarts because each
         # hop is its own jobs row with lock_until reclaim semantics.
         if req.durable:
-            chain_id = handoff.task_id
+            # Derive chain_id deterministically from the user's
+            # idempotency_key so retries collapse end-to-end: the queue's
+            # ON CONFLICT dedups the job row and the cached response
+            # carries the same chain_id, preventing two phantom chains
+            # for one logical request after a crash between enqueue and
+            # idem put. No idem key → single-shot semantics, fall back
+            # to the random task_id.
+            if idempotency_key:
+                chain_id = "chain-" + hashlib.sha256(
+                    f"{pid}:{idempotency_key}".encode()
+                ).hexdigest()[:24]
+                handoff = handoff.model_copy(update={"task_id": chain_id})
+            else:
+                chain_id = handoff.task_id
+            queue_idem_key = idempotency_key or f"{chain_id}:0"
             jid = job_queue.enqueue(
                 "runtime.chain.advance",
                 {
@@ -520,7 +535,7 @@ def build_app() -> FastAPI:
                     "handoff": handoff.model_dump(mode="json"),
                 },
                 project_id=pid,
-                idempotency_key=f"{chain_id}:0",
+                idempotency_key=queue_idem_key,
                 created_by="run/durable",
             )
             resp_d = {
@@ -674,25 +689,36 @@ def build_app() -> FastAPI:
         the next hop will not be enqueued.
         """
         pid = project_id or settings.project_name
-        # 1. Stamp the chain idem slot first so the in-flight handler
-        #    sees the cancel before it would re-enqueue the next hop.
-        idem_cache.put(
-            "chain",
-            chain_id,
-            {
-                "chain_id": chain_id,
-                "status": "cancelled",
-                "hops": [],
-            },
-            project_id=pid,
-            ttl_seconds=86400.0,
+        # 1. If the chain has already reached a terminal state in the
+        #    idem slot (`done` or `failed`), preserve it — overwriting
+        #    with `cancelled` + empty hops would erase completed work
+        #    from the client's view in a race between the last hop's
+        #    terminal write and a concurrently-arriving DELETE.
+        existing = idem_cache.get("chain", chain_id, project_id=pid)
+        already_terminal = bool(
+            existing and existing.get("status") in ("done", "failed")
         )
+        if not already_terminal:
+            # Stamp the chain idem slot so the in-flight handler sees
+            # the cancel before it would re-enqueue the next hop.
+            idem_cache.put(
+                "chain",
+                chain_id,
+                {
+                    "chain_id": chain_id,
+                    "status": "cancelled",
+                    "hops": [],
+                },
+                project_id=pid,
+                ttl_seconds=86400.0,
+            )
         # 2. Mark queued/locked successors so workers skip them too.
         cancelled = job_queue.cancel_chain(chain_id, project_id=pid)
         return {
             "chain_id": chain_id,
-            "status": "cancelled",
+            "status": existing.get("status") if already_terminal else "cancelled",
             "jobs_cancelled": cancelled,
+            **({"noop": "already_terminal"} if already_terminal else {}),
         }
 
     @app.get(

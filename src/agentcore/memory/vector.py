@@ -27,6 +27,7 @@ hand-editing DDL.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -122,15 +123,43 @@ class VectorStore:
 
         When `dim` is None, defaults to the registered dim of
         `settings.embed_model` (or the package default).
+
+        If `agentcore_chunks` already exists at a *different* embedding
+        dimension, raise loudly. `CREATE TABLE IF NOT EXISTS` is a no-op
+        when the table is present, so without this check a configuration
+        switch (e.g. swapping a 768-dim model for a 1024-dim one) would
+        silently leave the table at the old dim and every later upsert
+        would fail with a vector-dim error that the retrieval factory
+        swallows — silent retriever outage.
         """
         if dim is None:
             try:
                 dim = embedding_dim_for_model(self.settings.embed_model or DEFAULT_MODEL)
             except ValueError:
                 dim = EMBED_DIM
-        ddl = _build_ddl(dim)
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(ddl)
+            # Read the existing column type if the table is there. `to_regclass`
+            # returns NULL for missing tables, so the WHERE matches zero rows
+            # on first install and the check is skipped.
+            cur.execute(
+                """
+                SELECT format_type(a.atttypid, a.atttypmod)
+                  FROM pg_attribute a
+                 WHERE a.attrelid = to_regclass('agentcore_chunks')
+                   AND a.attname = 'embedding'
+                   AND NOT a.attisdropped
+                """
+            )
+            row = cur.fetchone()
+            if row:
+                existing = str(row[0])
+                m = re.match(r"vector\((\d+)\)", existing)
+                if m and int(m.group(1)) != dim:
+                    raise RuntimeError(
+                        f"agentcore_chunks.embedding has {existing} but requested "
+                        f"vector({dim}); migrate the table before changing embed_model"
+                    )
+            cur.execute(_build_ddl(dim))
             cur.execute("ANALYZE agentcore_chunks")
 
     def upsert(

@@ -20,10 +20,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import psycopg
 import structlog
 
 from agentcore.settings import Settings, get_settings
+from agentcore.state.db import pg_conn
 
 log = structlog.get_logger(__name__)
 
@@ -71,7 +71,7 @@ class IdempotencyStore:
         # Probe Postgres availability once. Failing quietly is correct here:
         # an unreachable DB shouldn't take down the orchestrator.
         try:
-            with psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            with pg_conn(self.settings) as conn, conn.cursor() as cur:
                 cur.execute(DDL)
             self._persistent = True
             log.info("idempotency.persistent")
@@ -86,9 +86,16 @@ class IdempotencyStore:
     ) -> dict[str, Any] | None:
         pid = project_id or self.settings.project_name
         if self._persistent:
-            with contextlib.suppress(Exception):
-                return self._get_pg(pid, scope, key)
-            # Fall through to memory if a live read fails (DB blip).
+            try:
+                hit = self._get_pg(pid, scope, key)
+            except Exception:
+                hit = None
+            if hit is not None:
+                return hit
+            # PG miss or blip: fall through to memory so a value that
+            # `put()` stashed during a transient PG outage is still
+            # returned. Without this, a put-then-get under DB flap
+            # silently drops the idempotency guarantee.
         return self._get_mem(pid, scope, key)
 
     def put(
@@ -115,7 +122,7 @@ class IdempotencyStore:
             return 0
         try:
             with (
-                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                pg_conn(self.settings) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -130,7 +137,7 @@ class IdempotencyStore:
 
     def _get_pg(self, pid: str, scope: str, key: str) -> dict[str, Any] | None:
         with (
-            psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(self.settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(
@@ -149,7 +156,7 @@ class IdempotencyStore:
     ) -> None:
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         with (
-            psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(self.settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(
