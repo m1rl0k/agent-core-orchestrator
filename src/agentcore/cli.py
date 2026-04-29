@@ -370,7 +370,7 @@ async def _plan_async(
     # most-relevant role with the aggregated blockers and re-run that
     # slice. Cap at `max_review_loops` so we never spin forever.
     verdicts: list[dict] = []
-    if review and state.get("dev_output"):
+    if review and state.get("developer_output"):
         for loop_idx in range(max_review_loops + 1):
             verdicts = await _run_review_round(router, registry, state)
             console.rule(f"[bold]review round {loop_idx + 1}[/bold]")
@@ -408,8 +408,8 @@ async def _plan_async(
             )
 
     applied: list[str] = []
-    if apply and state.get("dev_output"):
-        diffs = state["dev_output"].get("diffs") or []
+    if apply and state.get("developer_output"):
+        diffs = state["developer_output"].get("diffs") or []
         applied = _apply_diffs(repo, diffs)
         if applied:
             console.print(f"[green]applied {len(applied)} file(s):[/green] " + ", ".join(applied))
