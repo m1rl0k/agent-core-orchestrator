@@ -485,6 +485,45 @@ class JobQueue:
             log.warning("jobs.purge_dead_letter_failed", error=str(exc))
             return 0
 
+    def retry_dead_letter(
+        self, job_id: int, *, project_id: str | None = None
+    ) -> bool:
+        """Resurrect a dead-lettered job: reset attempts, status, lock,
+        and queue it for the next claim. Returns True iff a dead-letter
+        row matching `job_id` (and `project_id` if given) was actually
+        revived. Use after manually inspecting the failure and applying
+        a fix elsewhere — the worker will pick the job up on the next
+        poll."""
+        if not self._persistent:
+            return False
+        pid = project_id or self.settings.project_name
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    UPDATE agentcore_jobs
+                       SET status = 'queued',
+                           attempts = 0,
+                           run_after = now(),
+                           locked_by = NULL,
+                           locked_until = NULL,
+                           started_at = NULL,
+                           finished_at = NULL,
+                           error = NULL
+                     WHERE id = %s
+                       AND project_id = %s
+                       AND status = 'dead_letter'
+                    """,
+                    (job_id, pid),
+                )
+                return (cur.rowcount or 0) > 0
+        except Exception as exc:
+            log.warning("jobs.retry_failed", job_id=job_id, error=str(exc))
+            return False
+
     def cancel_chain(self, chain_id: str, *, project_id: str | None = None) -> int:
         """Mark queued chain-advance jobs for `chain_id` as cancelled.
 

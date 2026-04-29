@@ -219,5 +219,13 @@ class WikiStorage:
         return out
 
     def collection_name(self) -> str:
-        """The pgvector collection this storage's pages should be indexed under."""
-        return f"wiki:{self.project}:{self.branch}"
+        """The pgvector collection this storage's pages should be indexed under.
+
+        Routed through `wiki.naming.wiki_collection` so the format is
+        constructed identically across the codebase — no string-format
+        drift between writers and readers, no chance of a typo
+        crossing tenants.
+        """
+        from agentcore.wiki.naming import wiki_collection
+
+        return wiki_collection(self.project, self.branch)

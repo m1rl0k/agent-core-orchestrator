@@ -34,8 +34,12 @@ contract:
     # The QA LLM curates this raw output into the structured
     # `passed/failed/coverage_pct` fields below — the runtime imposes
     # no parsing.
-    - { name: test_run,   type: dict,   required: false }
-    - { name: test_command, type: list, required: false }
+    - { name: test_run,      type: dict,   required: false }
+    - { name: test_command,  type: list,   required: false }
+    # Per-candidate attempt log when the agent proposes multiple
+    # commands (e.g. pytest first, falling back to `python -m
+    # unittest`). Each entry: {command, exit_code, executor_status}.
+    - { name: test_attempts, type: list,   required: false }
   outputs:
     - { name: suite_summary, type: string,                required: true }
     - { name: passed,        type: "list[string]",        required: true }

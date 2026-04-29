@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Shared
@@ -48,6 +48,27 @@ class FileChange(BaseModel):
     path: str
     action: Literal["create", "modify", "delete"]
     rationale: str
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalise_action(cls, v: object) -> object:
+        """LLMs reach for `update`/`edit`/`change`/`add`/`remove`
+        instead of the canonical literals. Map them rather than
+        reject — the action's intent is unambiguous."""
+        if isinstance(v, str):
+            alias = {
+                "update": "modify",
+                "edit": "modify",
+                "change": "modify",
+                "patch": "modify",
+                "add": "create",
+                "new": "create",
+                "remove": "delete",
+                "rm": "delete",
+                "drop": "delete",
+            }
+            return alias.get(v.strip().lower(), v.strip().lower())
+        return v
 
 
 class TechnicalPlan(BaseModel):

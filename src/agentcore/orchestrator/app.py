@@ -566,6 +566,29 @@ def build_app() -> FastAPI:
         )
         return {"project_id": pid, "purged": n}
 
+    @app.post(
+        "/jobs/{job_id}/retry",
+        dependencies=[Depends(require_api_token)],
+    )
+    async def job_retry(
+        job_id: int,
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
+    ) -> dict[str, Any]:
+        """Resurrect a dead-lettered job: reset its attempts, requeue it,
+        and let the next worker claim it. 404 if no matching dead-letter
+        row for this project."""
+        pid = project_id or settings.project_name
+        ok = job_queue.retry_dead_letter(job_id, project_id=pid)
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"no dead-letter job {job_id} for project {pid!r} "
+                    "(maybe wrong id, wrong project, or not dead-lettered)"
+                ),
+            )
+        return {"job_id": job_id, "project_id": pid, "status": "queued"}
+
     @app.get("/tasks/{task_id}/trace")
     async def trace(task_id: str) -> dict[str, Any]:
         events = traces.for_task(task_id)

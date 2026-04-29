@@ -79,7 +79,9 @@ class WikiIndex:
             "sources": page.sources[:32],
             "status": page.frontmatter.get("status", "drafting"),
         }
-        ref = f"wiki:{self.storage.project}:{self.storage.branch}:{page.rel}"
+        from agentcore.wiki.naming import wiki_ref
+
+        ref = wiki_ref(self.storage.project, self.storage.branch, page.rel)
         try:
             self.vector.upsert(self.collection_name(), [(ref, text, meta, emb)])
         except Exception as exc:
@@ -92,7 +94,9 @@ class WikiIndex:
         aren't there."""
         if not self.is_ready:
             return
-        ref = f"wiki:{self.storage.project}:{self.storage.branch}:{rel}"
+        from agentcore.wiki.naming import wiki_ref
+
+        ref = wiki_ref(self.storage.project, self.storage.branch, rel)
         try:
             self.vector.delete_by_ref(self.collection_name(), ref)
         except Exception as exc:

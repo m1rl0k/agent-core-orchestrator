@@ -46,6 +46,17 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, help="agent-core-o
 console = Console()
 
 
+def _middle_truncate(s: str, width: int) -> str:
+    """Shrink `s` to <= `width` chars by collapsing the middle with `…`.
+    Keeps the meaningful prefix (project root) and the meaningful
+    suffix (filename) visible — better than tail-truncate for paths."""
+    if len(s) <= width or width < 5:
+        return s
+    head = (width - 1) // 2
+    tail = width - 1 - head
+    return f"{s[:head]}…{s[-tail:]}"
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
@@ -111,7 +122,7 @@ def doctor(
             f"{spec.llm.provider}/{spec.llm.model}",
             ", ".join(spec.contract.accepts_handoff_from),
             ", ".join(spec.contract.delegates_to),
-            (spec.source_path or "")[-60:],
+            _middle_truncate(spec.source_path or "", 60),
         )
     console.print(a_table)
     if registry.errors():
@@ -298,6 +309,12 @@ def plan(
         help="Max review iterations before giving up. Pass 0 for unlimited "
         "(developer keeps revising until every reviewer approves).",
     ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Suppress human-readable panels and emit a single JSON object "
+        "to stdout when the chain completes. Use in CI / scripting.",
+    ),
 ) -> None:
     """Run the role mesh end-to-end on this repo.
 
@@ -316,6 +333,7 @@ def plan(
         pr=pr,
         repo=repo,
         max_review_loops=max_review_loops,
+        as_json=as_json,
     ))
 
 
@@ -329,6 +347,36 @@ async def _plan_async(
     pr: bool = False,
     repo: Path = Path("."),
     max_review_loops: int = 2,
+    as_json: bool = False,
+) -> None:
+    # JSON mode: suppress every rich panel along the way (set
+    # `console.quiet = True`) and emit one machine-readable JSON
+    # object to stdout at the end. Behaviour for human mode is
+    # unchanged.
+    prior_quiet = console.quiet
+    if as_json:
+        console.quiet = True
+    try:
+        await _plan_async_body(
+            brief, chain, max_hops,
+            review=review, apply=apply, pr=pr, repo=repo,
+            max_review_loops=max_review_loops, as_json=as_json,
+        )
+    finally:
+        console.quiet = prior_quiet
+
+
+async def _plan_async_body(
+    brief: str,
+    chain: bool,
+    max_hops: int,
+    *,
+    review: bool = True,
+    apply: bool = True,
+    pr: bool = False,
+    repo: Path = Path("."),
+    max_review_loops: int = 2,
+    as_json: bool = False,
 ) -> None:
     from agentcore.memory import prf
     from agentcore.memory.graph import KnowledgeGraph
@@ -464,10 +512,11 @@ async def _plan_async(
         else:
             console.print("[yellow]no diffs applied[/yellow]")
 
+    pr_url: str | None = None
     if pr and applied:
-        url = _open_github_pr(repo, brief, state, task_id)
-        if url:
-            console.print(f"[green]PR opened:[/green] {url}")
+        pr_url = _open_github_pr(repo, brief, state, task_id)
+        if pr_url:
+            console.print(f"[green]PR opened:[/green] {pr_url}")
 
     # Chain-end PRF tagging.
     if state.get("qa_output") is not None:
@@ -482,6 +531,27 @@ async def _plan_async(
             graph.tag_task(task_id, prf.POSITIVE)
 
     graph.save()
+
+    # JSON mode: emit a single structured object to stdout. The outer
+    # `_plan_async` wrapper handles console.quiet restore in its
+    # finally block so any raise between here and there still cleans
+    # up. Schema is intentionally flat for easy `jq`-ing in CI:
+    # `agentcore plan ... --json | jq '.applied'`.
+    if as_json:
+        result = {
+            "task_id": task_id,
+            "approved": all(v.get("approved") for v in verdicts) if verdicts else None,
+            "verdicts": verdicts,
+            "applied": applied,
+            "pr_url": pr_url,
+            "qa": state.get("qa_output"),
+            "plan": state.get("architect_output"),
+            "patch": state.get("developer_output"),
+        }
+        import sys as _sys
+
+        _sys.stdout.write(json.dumps(result, default=str, indent=2) + "\n")
+        _sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +679,12 @@ async def _run_review_round(
         spec = registry.get(role)
         if spec is None:
             continue
+        # Spinner so the human sees we're not stuck while the LLM thinks.
+        spinner = Status(
+            f"[bold yellow]{role}[/bold yellow] reviewing…",
+            console=console,
+            spinner="dots",
+        )
         sys = (
             f"You are the {spec.soul.role}. Voice: {spec.soul.voice}. "
             f"Values: {', '.join(spec.soul.values)}. "
@@ -631,11 +707,12 @@ async def _run_review_round(
             f"```json\n{payload_summary}\n```"
         )
         try:
-            resp = await router.complete(
-                [ChatMessage(role="system", content=sys),
-                 ChatMessage(role="user", content=user)],
-                spec.llm,
-            )
+            with spinner:
+                resp = await router.complete(
+                    [ChatMessage(role="system", content=sys),
+                     ChatMessage(role="user", content=user)],
+                    spec.llm,
+                )
         except Exception as exc:
             verdicts.append({
                 "agent": role,
