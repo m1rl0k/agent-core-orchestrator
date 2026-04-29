@@ -34,6 +34,7 @@ log = structlog.get_logger(__name__)
 DDL = """
 CREATE TABLE IF NOT EXISTS agentcore_jobs (
   id              BIGSERIAL PRIMARY KEY,
+  project_id      TEXT NOT NULL DEFAULT 'default',
   kind            TEXT NOT NULL,
   status          TEXT NOT NULL DEFAULT 'queued',
   payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -51,9 +52,11 @@ CREATE TABLE IF NOT EXISTS agentcore_jobs (
   error           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_claim
-  ON agentcore_jobs (status, run_after, priority DESC, created_at);
+  ON agentcore_jobs (project_id, status, run_after, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_agentcore_jobs_project
+  ON agentcore_jobs (project_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idem
-  ON agentcore_jobs (kind, idempotency_key)
+  ON agentcore_jobs (project_id, kind, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 """
 
@@ -108,18 +111,20 @@ class JobQueue:
         kind: str,
         payload: dict[str, Any] | None = None,
         *,
+        project_id: str | None = None,
         idempotency_key: str | None = None,
         priority: int = 0,
         run_after: datetime | None = None,
         max_attempts: int = 3,
         created_by: str | None = None,
     ) -> int | None:
+        pid = project_id or self.settings.project_name
         payload = payload or {}
         run_after = run_after or datetime.now(UTC)
         if self._persistent:
             with contextlib.suppress(Exception):
                 return self._enqueue_pg(
-                    kind, payload, idempotency_key, priority, run_after,
+                    pid, kind, payload, idempotency_key, priority, run_after,
                     max_attempts, created_by,
                 )
         # Fallback: stash for an immediate in-process worker drain.
@@ -127,6 +132,7 @@ class JobQueue:
 
     def _enqueue_pg(
         self,
+        pid: str,
         kind: str,
         payload: dict[str, Any],
         idempotency_key: str | None,
@@ -139,30 +145,34 @@ class JobQueue:
             psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
             conn.cursor() as cur,
         ):
-            # ON CONFLICT honours the partial unique index for (kind, idem_key)
-            # so duplicate webhooks return the existing job id rather than enqueuing twice.
+            # ON CONFLICT honours the partial unique index on
+            # (project_id, kind, idempotency_key) so duplicate webhooks within
+            # one project collapse but other projects stay independent.
             if idempotency_key is not None:
                 cur.execute(
                     """
                     INSERT INTO agentcore_jobs
-                      (kind, payload, idempotency_key, priority, run_after, max_attempts, created_by)
-                    VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s)
-                    ON CONFLICT (kind, idempotency_key) WHERE idempotency_key IS NOT NULL
+                      (project_id, kind, payload, idempotency_key, priority,
+                       run_after, max_attempts, created_by)
+                    VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, kind, idempotency_key)
+                      WHERE idempotency_key IS NOT NULL
                     DO UPDATE SET kind = EXCLUDED.kind  -- no-op to RETURNING
                     RETURNING id
                     """,
-                    (kind, json.dumps(payload), idempotency_key, priority,
+                    (pid, kind, json.dumps(payload), idempotency_key, priority,
                      run_after, max_attempts, created_by),
                 )
             else:
                 cur.execute(
                     """
                     INSERT INTO agentcore_jobs
-                      (kind, payload, priority, run_after, max_attempts, created_by)
-                    VALUES (%s, %s::jsonb, %s, %s, %s, %s)
+                      (project_id, kind, payload, priority, run_after,
+                       max_attempts, created_by)
+                    VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (kind, json.dumps(payload), priority, run_after,
+                    (pid, kind, json.dumps(payload), priority, run_after,
                      max_attempts, created_by),
                 )
             row = cur.fetchone()
@@ -178,22 +188,40 @@ class JobQueue:
 
     # ---- consumer side ----------------------------------------------
 
-    def claim(self, worker_id: str, lock_seconds: int = 600) -> Job | None:
-        """Atomically claim a single ready job. Returns None if nothing is ready."""
+    def claim(
+        self,
+        worker_id: str,
+        lock_seconds: int = 600,
+        *,
+        project_id: str | None = None,
+    ) -> Job | None:
+        """Atomically claim a single ready job for `project_id` (defaults
+        to the orchestrator's `project_name`). Returns None if nothing
+        ready. Pass `project_id="*"` to claim across all projects (admin
+        worker). Other tenants' jobs stay safely partitioned by default."""
         if not self._persistent:
             return self._claim_mem()
+        pid = project_id if project_id is not None else self.settings.project_name
         try:
-            return self._claim_pg(worker_id, lock_seconds)
+            return self._claim_pg(worker_id, lock_seconds, pid)
         except Exception as exc:
             log.warning("jobs.claim_failed", error=str(exc))
             return None
 
-    def _claim_pg(self, worker_id: str, lock_seconds: int) -> Job | None:
-        sql = """
+    def _claim_pg(
+        self, worker_id: str, lock_seconds: int, pid: str
+    ) -> Job | None:
+        scope_clause = "" if pid == "*" else "AND project_id = %s "
+        params: list[Any] = []
+        if pid != "*":
+            params.append(pid)
+        params.extend([worker_id, str(lock_seconds)])
+        sql = f"""
         WITH next AS (
           SELECT id FROM agentcore_jobs
-           WHERE (status = 'queued' AND run_after <= now())
-              OR (status = 'running' AND locked_until IS NOT NULL AND locked_until < now())
+           WHERE ((status = 'queued' AND run_after <= now())
+                  OR (status = 'running' AND locked_until IS NOT NULL AND locked_until < now()))
+                 {scope_clause}
            ORDER BY priority DESC, created_at ASC
            FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -212,7 +240,7 @@ class JobQueue:
             psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
             conn.cursor() as cur,
         ):
-            cur.execute(sql, (worker_id, str(lock_seconds)))
+            cur.execute(sql, params)
             row = cur.fetchone()
         if not row:
             return None
