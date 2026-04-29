@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import re
+import stat
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any
 
 import typer
 import uvicorn
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.status import Status
+from rich.syntax import Syntax
 from rich.table import Table
 
 from agentcore.adapters.claude_code import (
@@ -142,8 +151,6 @@ def up(
         console.print("[red]postgres failed to start[/red] — check `docker compose logs postgres`.")
         raise typer.Exit(code=3)
     # generic "all"
-    import subprocess
-
     compose = _compose_file_path()
     if compose is None:
         console.print("[red]no docker-compose.yml found[/red] in cwd or any parent.")
@@ -169,8 +176,6 @@ def down() -> None:
     if compose is None:
         console.print("[red]no docker-compose.yml found[/red]")
         raise typer.Exit(code=2)
-    import subprocess
-
     rc = subprocess.run(
         ["docker", "compose", "-f", str(compose), "down"], check=False
     ).returncode
@@ -335,7 +340,6 @@ async def _plan_async(
 
     router = LLMRouter(settings)
     traces = TraceLog()
-    import contextlib
 
     graph = KnowledgeGraph(settings=settings)
     try:
@@ -442,7 +446,7 @@ async def _plan_async(
 
 
 async def _run_chain(
-    runtime,  # type: ignore[no-untyped-def]
+    runtime: Runtime,
     brief: str,
     chain: bool,
     max_hops: int,
@@ -455,11 +459,6 @@ async def _run_chain(
     syntax-highlighted JSON for each completed hop, and inline Syntax for any
     unified diffs in the developer's payload.
     """
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-    from rich.status import Status
-    from rich.syntax import Syntax
-
     handoff = Handoff(
         task_id=new_task_id(),
         from_agent="user",
@@ -479,55 +478,52 @@ async def _run_chain(
     for _ in range(max_hops):
         if current is None:
             break
-        # Progress spinner while the LLM is thinking.
-        status = Status(
-            f"[bold yellow]{current.to_agent}[/bold yellow] thinking…  "
-            f"(step {current.step})",
+        spinner = Status(
+            f"[bold yellow]{current.to_agent}[/bold yellow] thinking…  (step {current.step})",
             console=console,
             spinner="dots",
         )
-        status.start()
-        try:
+        with spinner:
             outcome, nxt = await runtime.execute(current)
-        finally:
-            status.stop()
         state[f"{outcome.agent}_output"] = outcome.output
-
-        body_renderable: Any
-        try:
-            body_renderable = Syntax(
-                json.dumps(outcome.output, indent=2),
-                "json",
-                theme="ansi_dark",
-                line_numbers=False,
-                word_wrap=True,
-            )
-        except (TypeError, ValueError):
-            body_renderable = Markdown(str(outcome.output)[:4000])
-
-        console.print(
-            Panel(
-                body_renderable,
-                title=f"[bold]{outcome.agent}[/bold] · {outcome.status}",
-                border_style="green" if outcome.status == "ok" or outcome.status == "delegated" else "yellow",
-                padding=(0, 1),
-            )
-        )
-        # Bonus: surface unified diffs with proper syntax highlighting.
-        for d in outcome.output.get("diffs", []) or []:
-            if isinstance(d, dict) and d.get("unified_diff"):
-                console.print(
-                    Panel(
-                        Syntax(d["unified_diff"], "diff", theme="ansi_dark"),
-                        title=f"diff · {d.get('path', '?')}",
-                        border_style="blue",
-                        padding=(0, 1),
-                    )
-                )
+        _print_outcome(outcome)
         if not (chain and nxt):
             break
         current = nxt
     return state, handoff.task_id
+
+
+def _print_outcome(outcome) -> None:  # type: ignore[no-untyped-def]
+    """Render one chain hop: JSON panel + any unified diffs."""
+    try:
+        body = Syntax(
+            json.dumps(outcome.output, indent=2),
+            "json",
+            theme="ansi_dark",
+            line_numbers=False,
+            word_wrap=True,
+        )
+    except (TypeError, ValueError):
+        body = Markdown(str(outcome.output)[:4000])
+    border = "green" if outcome.status in ("ok", "delegated") else "yellow"
+    console.print(
+        Panel(
+            body,
+            title=f"[bold]{outcome.agent}[/bold] · {outcome.status}",
+            border_style=border,
+            padding=(0, 1),
+        )
+    )
+    for d in outcome.output.get("diffs", []) or []:
+        if isinstance(d, dict) and d.get("unified_diff"):
+            console.print(
+                Panel(
+                    Syntax(d["unified_diff"], "diff", theme="ansi_dark"),
+                    title=f"diff · {d.get('path', '?')}",
+                    border_style="blue",
+                    padding=(0, 1),
+                )
+            )
 
 
 async def _run_review_round(
