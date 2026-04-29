@@ -216,9 +216,11 @@ def build_app() -> FastAPI:
     async def run(
         req: RunRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
     ) -> RunResponse:
+        pid = project_id or settings.project_name
         if idempotency_key:
-            cached = idem_cache.get("run", idempotency_key)
+            cached = idem_cache.get("run", idempotency_key, project_id=pid)
             if cached is not None:
                 return RunResponse(**cached)
         handoff = Handoff(
@@ -248,16 +250,18 @@ def build_app() -> FastAPI:
         save_graph_best_effort()
         resp = RunResponse(task_id=handoff.task_id, hops=hops)
         if idempotency_key:
-            idem_cache.put("run", idempotency_key, resp.model_dump())
+            idem_cache.put("run", idempotency_key, resp.model_dump(), project_id=pid)
         return resp
 
     @app.post("/handoff", response_model=RunResponse, dependencies=[Depends(require_api_token)])
     async def handoff_one(
         req: HandoffRequest,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
     ) -> RunResponse:
+        pid = project_id or settings.project_name
         if idempotency_key:
-            cached = idem_cache.get("handoff", idempotency_key)
+            cached = idem_cache.get("handoff", idempotency_key, project_id=pid)
             if cached is not None:
                 return RunResponse(**cached)
         handoff = Handoff(
@@ -278,16 +282,18 @@ def build_app() -> FastAPI:
             hops=[{"agent": outcome.agent, "status": outcome.status, "output": outcome.output}],
         )
         if idempotency_key:
-            idem_cache.put("handoff", idempotency_key, resp.model_dump())
+            idem_cache.put("handoff", idempotency_key, resp.model_dump(), project_id=pid)
         return resp
 
     @app.post("/signal", dependencies=[Depends(require_api_token)])
     async def receive_signal(
         sig: SignalIn,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
     ) -> dict[str, Any]:
+        pid = project_id or settings.project_name
         if idempotency_key:
-            cached = idem_cache.get("signal", idempotency_key)
+            cached = idem_cache.get("signal", idempotency_key, project_id=pid)
             if cached is not None:
                 return cached
         # Signals route to Ops by convention; Ops decides whether to escalate.
@@ -308,7 +314,7 @@ def build_app() -> FastAPI:
         save_graph_best_effort()
         resp = {"task_id": handoff.task_id, "outcome": outcome.model_dump()}
         if idempotency_key:
-            idem_cache.put("signal", idempotency_key, resp)
+            idem_cache.put("signal", idempotency_key, resp, project_id=pid)
         return resp
 
     @app.get("/tasks/{task_id}/trace")
@@ -452,7 +458,9 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
     async def wiki_refresh(
         req: WikiRefreshIn,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        project_id: str | None = Header(default=None, alias="X-Project-Id"),
     ) -> dict[str, Any]:
+        pid = project_id or settings.project_name
         """Enqueue a wiki refresh. Lint is cheap so stays inline.
 
         Seed/incremental are pushed to the durable Postgres job queue —
@@ -472,11 +480,12 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
         if req.mode == "seed":
             jid = job_queue.enqueue(
                 "wiki.refresh.seed",
-                {"commit_sha": req.commit_sha},
+                {"commit_sha": req.commit_sha, "project_id": pid},
+                project_id=pid,
                 idempotency_key=idempotency_key,
                 created_by="wiki/refresh",
             )
-            return {"mode": "seed", "status": "queued", "job_id": jid}
+            return {"mode": "seed", "status": "queued", "job_id": jid, "project_id": pid}
         # default: incremental
         changed_paths = list(req.changed_paths)
         if len(changed_paths) > settings.wiki_max_changed_paths:
@@ -486,11 +495,16 @@ def _register_wiki_routes(  # type: ignore[no-untyped-def]
             )
         jid = job_queue.enqueue(
             "wiki.refresh.incremental",
-            {"changed_paths": changed_paths, "commit_sha": req.commit_sha},
+            {
+                "changed_paths": changed_paths,
+                "commit_sha": req.commit_sha,
+                "project_id": pid,
+            },
+            project_id=pid,
             idempotency_key=idempotency_key,
             created_by="wiki/refresh",
         )
-        return {"mode": "incremental", "status": "queued", "job_id": jid}
+        return {"mode": "incremental", "status": "queued", "job_id": jid, "project_id": pid}
 
 
 app = build_app()
