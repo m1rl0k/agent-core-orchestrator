@@ -194,27 +194,55 @@ class JobQueue:
         lock_seconds: int = 600,
         *,
         project_id: str | None = None,
+        kind_limits: dict[str, int] | None = None,
     ) -> Job | None:
         """Atomically claim a single ready job for `project_id` (defaults
         to the orchestrator's `project_name`). Returns None if nothing
         ready. Pass `project_id="*"` to claim across all projects (admin
-        worker). Other tenants' jobs stay safely partitioned by default."""
+        worker). Other tenants' jobs stay safely partitioned by default.
+
+        `kind_limits` caps cluster-wide concurrency per job kind: any kind
+        already at its cap (counted across all running jobs with valid
+        leases) is skipped during this claim. Kinds absent from the dict
+        are unbounded.
+        """
         if not self._persistent:
             return self._claim_mem()
         pid = project_id if project_id is not None else self.settings.project_name
         try:
-            return self._claim_pg(worker_id, lock_seconds, pid)
+            return self._claim_pg(worker_id, lock_seconds, pid, kind_limits)
         except Exception as exc:
             log.warning("jobs.claim_failed", error=str(exc))
             return None
 
     def _claim_pg(
-        self, worker_id: str, lock_seconds: int, pid: str
+        self,
+        worker_id: str,
+        lock_seconds: int,
+        pid: str,
+        kind_limits: dict[str, int] | None = None,
     ) -> Job | None:
         scope_clause = "" if pid == "*" else "AND project_id = %s "
+        # Per-kind concurrency cap. We read the limits as JSONB, group
+        # currently-running jobs by kind, and exclude any kind whose
+        # in-flight count already meets its cap.
+        cap_clause = ""
         params: list[Any] = []
         if pid != "*":
             params.append(pid)
+        if kind_limits:
+            cap_clause = (
+                "AND kind NOT IN ("
+                "  SELECT j2.kind FROM agentcore_jobs j2 "
+                "   WHERE j2.status = 'running' "
+                "     AND j2.locked_until IS NOT NULL "
+                "     AND j2.locked_until > now() "
+                "     AND (%s::jsonb) ? j2.kind "
+                "   GROUP BY j2.kind "
+                "   HAVING count(*) >= ((%s::jsonb)->>j2.kind)::int"
+                ")"
+            )
+            params.extend([json.dumps(kind_limits), json.dumps(kind_limits)])
         params.extend([worker_id, str(lock_seconds)])
         sql = f"""
         WITH next AS (
@@ -222,6 +250,7 @@ class JobQueue:
            WHERE ((status = 'queued' AND run_after <= now())
                   OR (status = 'running' AND locked_until IS NOT NULL AND locked_until < now()))
                  {scope_clause}
+                 {cap_clause}
            ORDER BY priority DESC, created_at ASC
            FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -264,6 +293,36 @@ class JobQueue:
             return
         with contextlib.suppress(Exception):
             self._update_status(job_id, "done", error=None)
+
+    def extend_lease(
+        self, job_id: int, *, worker_id: str, seconds: int = 600
+    ) -> bool:
+        """Bump `locked_until` for a still-owned running job. The owner
+        check (`locked_by = worker_id`) means a worker that lost its
+        lease (e.g. paused past the previous expiry, then a peer claimed
+        the job) cannot accidentally re-extend a job it no longer owns.
+        Returns True iff the lease was extended."""
+        if not self._persistent:
+            return False
+        try:
+            with (
+                psycopg.connect(self.settings.pg_dsn, autocommit=True) as conn,
+                conn.cursor() as cur,
+            ):
+                cur.execute(
+                    """
+                    UPDATE agentcore_jobs
+                       SET locked_until = now() + (%s || ' seconds')::interval
+                     WHERE id = %s
+                       AND locked_by = %s
+                       AND status = 'running'
+                    """,
+                    (str(seconds), job_id, worker_id),
+                )
+                return (cur.rowcount or 0) > 0
+        except Exception as exc:
+            log.warning("jobs.extend_lease_failed", job_id=job_id, error=str(exc))
+            return False
 
     def fail(self, job_id: int, error: str, *, retry_in_seconds: int = 30) -> None:
         """Mark failed; reschedule if attempts remain."""
@@ -354,6 +413,37 @@ def default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
+async def _heartbeat_loop(
+    queue: JobQueue,
+    job_id: int,
+    worker_id: str,
+    lock_seconds: int,
+    stop: Any,
+) -> None:
+    """Periodically extend the lease for an in-flight job.
+
+    Beats at `lock_seconds / 3` (min 15s) so even a 600s lease gets at
+    least one renewal before expiry. If we ever lose ownership (peer
+    stole the job after we missed a heartbeat), we log and exit — the
+    handler still finishes, but its `complete()` will no-op cleanly
+    since the job is no longer ours.
+    """
+    import asyncio
+
+    interval = max(15.0, lock_seconds / 3.0)
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        if not queue.extend_lease(
+            job_id, worker_id=worker_id, seconds=lock_seconds
+        ):
+            log.warning("worker.lease_lost", job_id=job_id, worker_id=worker_id)
+            return
+
+
 async def run_worker(
     queue: JobQueue,
     handlers: dict[str, Handler],
@@ -362,21 +452,33 @@ async def run_worker(
     poll_interval: float = 1.0,
     lock_seconds: int = 600,
     stop_event: Any = None,
+    kind_limits: dict[str, int] | None = None,
 ) -> None:
     """Drain `queue`, dispatching by `kind` to the matching handler.
 
     `stop_event` (asyncio.Event) is the cancellation signal — set it during
     lifespan shutdown so the loop exits cleanly.
+
+    `kind_limits` caps cluster-wide concurrency per kind. e.g.
+    `{"wiki_refresh": 1, "remediation_run": 4}` keeps wiki rebuilds
+    serial and lets up to 4 remediations fan out.
+
+    A heartbeat task extends the lease while the handler is running, so
+    handlers can safely run longer than `lock_seconds` without another
+    worker stealing the job.
     """
     import asyncio
 
     wid = worker_id or default_worker_id()
-    log.info("worker.start", worker_id=wid, kinds=list(handlers.keys()))
+    log.info(
+        "worker.start", worker_id=wid, kinds=list(handlers.keys()),
+        kind_limits=kind_limits or {},
+    )
     while True:
         if stop_event is not None and stop_event.is_set():
             log.info("worker.stop", worker_id=wid)
             return
-        job = queue.claim(wid, lock_seconds=lock_seconds)
+        job = queue.claim(wid, lock_seconds=lock_seconds, kind_limits=kind_limits)
         if job is None:
             try:
                 if stop_event is not None:
@@ -394,6 +496,10 @@ async def run_worker(
             log.warning("worker.unknown_kind", kind=job.kind, job_id=job.id)
             queue.fail(job.id, f"no handler for kind {job.kind!r}")
             continue
+        hb_stop = asyncio.Event()
+        hb_task = asyncio.create_task(
+            _heartbeat_loop(queue, job.id, wid, lock_seconds, hb_stop)
+        )
         try:
             await handler(job.payload)
             queue.complete(job.id)
@@ -402,3 +508,7 @@ async def run_worker(
                 "worker.handler_failed", kind=job.kind, job_id=job.id, error=str(exc)
             )
             queue.fail(job.id, repr(exc))
+        finally:
+            hb_stop.set()
+            with contextlib.suppress(Exception):
+                await hb_task

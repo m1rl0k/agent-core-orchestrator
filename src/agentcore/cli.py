@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 import re
-import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -36,7 +34,7 @@ from agentcore.capabilities import detect_capabilities
 from agentcore.contracts.envelopes import Handoff, new_task_id
 from agentcore.host import detect_host, render_install_hint
 from agentcore.language import detect_languages, probe_lsps
-from agentcore.llm.router import LLMRouter
+from agentcore.llm.router import ChatMessage, LLMRouter
 from agentcore.logging_setup import configure_logging
 from agentcore.orchestrator.runtime import Runtime
 from agentcore.orchestrator.traces import TraceLog
@@ -295,13 +293,18 @@ def plan(
     ),
     repo: Path = typer.Option(Path("."), help="Repo root for --apply / --pr"),
     max_review_loops: int = typer.Option(
-        2, help="Max review iterations before giving up"
+        10,
+        help="Max review iterations before giving up. Pass 0 for unlimited "
+        "(developer keeps revising until every reviewer approves).",
     ),
 ) -> None:
     """Run the role mesh end-to-end on this repo.
 
-    Default workflow: chain → review round → if any blockers, route back &
-    re-run → apply once unanimous → optionally open a PR.
+    Default workflow: chain → review round → if any reviewer rejects, route
+    back to whichever role the rejecter pointed at (developer for patch-level,
+    architect for plan-level, qa for test gaps) → re-chain → review again.
+    Iterates until unanimous approval, then applies the diffs and optionally
+    opens a PR. Use `--max-review-loops 0` for true loop-until-approved.
     """
     asyncio.run(_plan_async(
         brief,
@@ -371,11 +374,13 @@ async def _plan_async(
     state, task_id = await _run_chain(runtime, brief, chain, max_hops)
 
     # Review loop — default ON. If any role rejects, route back to the
-    # most-relevant role with the aggregated blockers and re-run that
-    # slice. Cap at `max_review_loops` so we never spin forever.
+    # role best-suited to fix the blockers and re-chain. Iterates until
+    # unanimous approval. `max_review_loops == 0` means unlimited; any
+    # positive value is a safety cap.
     verdicts: list[dict] = []
     if review and state.get("developer_output"):
-        for loop_idx in range(max_review_loops + 1):
+        loop_idx = 0
+        while True:
             verdicts = await _run_review_round(router, registry, state)
             console.rule(f"[bold]review round {loop_idx + 1}[/bold]")
             for v in verdicts:
@@ -386,18 +391,17 @@ async def _plan_async(
             if all(v["approved"] for v in verdicts):
                 console.print("[bold green]all roles approved[/bold green]")
                 break
-            if loop_idx >= max_review_loops:
+            if max_review_loops > 0 and loop_idx + 1 >= max_review_loops:
                 console.print(
                     f"[yellow]max review loops ({max_review_loops}) reached without "
                     "unanimous approval — not applying[/yellow]"
                 )
                 apply = False
                 break
-            # Route back to whichever role the first rejecter pointed at.
             blockers = [b for v in verdicts if not v["approved"] for b in v.get("blockers", [])]
             target = next(
-                (v.get("route_back_to", "architect") for v in verdicts if not v["approved"]),
-                "architect",
+                (v.get("route_back_to", "developer") for v in verdicts if not v["approved"]),
+                "developer",
             )
             console.print(
                 f"[yellow]routing back to {target}[/yellow] with "
@@ -410,6 +414,7 @@ async def _plan_async(
                 max_hops,
                 start_at=target,
             )
+            loop_idx += 1
 
     applied: list[str] = []
     if apply and state.get("developer_output"):
@@ -458,10 +463,18 @@ async def _run_chain(
     Pretty output: rich Live status while each agent is thinking, Panel +
     syntax-highlighted JSON for each completed hop, and inline Syntax for any
     unified diffs in the developer's payload.
+
+    `from_agent` on the synthesized handoff is auto-resolved against the
+    target's contract: most roles only accept handoffs from specific
+    upstream roles, so a route-back to e.g. 'developer' must come from
+    'architect', not 'user' (else the runtime rejects it).
     """
+    spec = runtime.registry.get(start_at)
+    accepts = list(getattr(spec.contract, "accepts_handoff_from", [])) if spec else []
+    from_agent = "user" if "user" in accepts or not accepts else accepts[0]
     handoff = Handoff(
         task_id=new_task_id(),
-        from_agent="user",
+        from_agent=from_agent,
         to_agent=start_at,
         payload={"brief": brief},
     )
@@ -537,8 +550,6 @@ async def _run_review_round(
     developer on patch correctness, qa on test coverage, ops on shipping
     safety. Returns one dict per agent (parallel of ReviewVerdict).
     """
-    from agentcore.llm.router import ChatMessage
-
     payload_summary = json.dumps(
         {
             "plan": state.get("architect_output"),
@@ -591,8 +602,6 @@ async def _run_review_round(
             })
             continue
         # Parse the JSON object, lenient.
-        import re
-
         match = re.search(r"\{.*\}", resp.text, re.DOTALL)
         if not match:
             verdicts.append({
@@ -639,10 +648,6 @@ def _apply_diffs(repo: Path, diffs: list[dict]) -> list[str]:
     diffs whose context anchors don't match the file (LLMs sometimes invent
     context lines). Returns the list of paths actually written.
     """
-    import contextlib
-    import subprocess
-    import tempfile
-
     repo = Path(repo).resolve()
     written: list[str] = []
     for d in diffs:
@@ -694,8 +699,6 @@ def _open_github_pr(
     Skipped silently if AGENTCORE_ENABLE_GITHUB is false or the gh capability
     isn't ready — caller decides whether to surface that.
     """
-    import subprocess
-
     settings = get_settings()
     if not settings.enable_github:
         console.print("[yellow]--pr requested but AGENTCORE_ENABLE_GITHUB=false[/yellow]")
@@ -914,7 +917,6 @@ def _resolve_branch(repo_root: Path) -> str:
 
 def _build_wiki_stack(settings, repo_root: Path):  # type: ignore[no-untyped-def]
     """Wire WikiStorage + WikiIndex + WikiCurator from current settings."""
-    from agentcore.llm.router import LLMRouter
     from agentcore.wiki.curator import WikiCurator
     from agentcore.wiki.index import WikiIndex
     from agentcore.wiki.storage import WikiStorage

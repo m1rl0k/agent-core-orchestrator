@@ -207,6 +207,9 @@ def validate_payload(
             if field.required:
                 errors.append(f"missing required field {field.name!r}")
             continue
+        # Optional field set explicitly to null is treated as omitted.
+        if payload[field.name] is None and not field.required:
+            continue
         err = _check_field(field, payload[field.name])
         if err:
             errors.append(err)
