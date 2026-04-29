@@ -24,13 +24,18 @@ contract:
     - { name: plan_summary, type: string, required: true }
     - { name: diffs,        type: list,   required: true }
     - { name: notes,        type: string, required: false }
-    # Populated by the `tests` executor before the LLM runs: real
-    # pytest / go test / cargo test / jest / mvn / ctest results from a
-    # sandbox worktree. Optional because the executor reports
-    # `executor_status` like `no_runner` when no test framework is on
-    # PATH — QA still produces a verdict in that case, just without
-    # ground truth.
-    - { name: test_run,     type: dict,   required: false }
+    # Raw result of the test command discovered + run by the runtime
+    # (see `discovers_commands: true` below). Shape:
+    #   {exit_code, stdout_tail, stderr_tail, applied_files,
+    #    command, executor_status, ...}
+    # Optional because discovery may legitimately emit `command: []`
+    # for a diff that doesn't warrant tests (docs-only, config tweak).
+    # In that case QA still produces a verdict from inspection alone.
+    # The QA LLM curates this raw output into the structured
+    # `passed/failed/coverage_pct` fields below — the runtime imposes
+    # no parsing.
+    - { name: test_run,   type: dict,   required: false }
+    - { name: test_command, type: list, required: false }
   outputs:
     - { name: suite_summary, type: string,                required: true }
     - { name: passed,        type: "list[string]",        required: true }
@@ -46,13 +51,15 @@ knowledge:
   graph_communities: [dependencies]
   code_scopes: ["**/*"]
 
-# Pre-LLM executor: actually run the test suite against the developer's
-# diffs in a temp git worktree. Polyglot — auto-detects pytest / go test /
-# cargo test / jest / mvn / gradle / dotnet / ctest / rspec / phpunit and
-# uses whatever is already on PATH. Never installs anything; if no runner
-# is detected the QA LLM sees `executor_status='no_runner'` and proceeds
-# without ground truth.
-executors: [tests]
+# Self-discovery: before the QA LLM call, the runtime asks the agent
+# to look at the developer's diffs and propose ONE shell command that
+# runs the relevant tests. The command must already be on PATH (the
+# runtime NEVER installs anything). It runs in a temp git worktree
+# with the diffs applied, captures real exit code + stdout + stderr,
+# and merges the result as `test_run` into the payload before the
+# main QA call. This way QA grounds itself in real output regardless
+# of language/framework — no static config, no per-language sniffing.
+discovers_commands: true
 ---
 
 You are **QA**.

@@ -340,7 +340,31 @@ async def _plan_async(
     # `tests` runner needs to know which repo to clone into a worktree).
     # Setting an env var rather than threading the path through every
     # handoff keeps the contracts unchanged.
-    os.environ["AGENTCORE_REPO_ROOT"] = str(repo.resolve())
+    repo_abs = repo.resolve()
+    repo_abs.mkdir(parents=True, exist_ok=True)
+    # Greenfield bootstrap: if the path isn't a git repo yet, init one
+    # so `git worktree add` (used by the validation runner) works. The
+    # chain may produce diffs that scaffold a brand-new project — we
+    # want that to "just work" without the user pre-running `git init`.
+    if not (repo_abs / ".git").is_dir():
+        with contextlib.suppress(subprocess.CalledProcessError, FileNotFoundError):
+            subprocess.run(
+                ["git", "-C", str(repo_abs), "init", "--quiet"],
+                check=True, capture_output=True,
+            )
+            # Need at least one commit for `git worktree add` to be happy.
+            (repo_abs / ".gitkeep").touch()
+            subprocess.run(
+                ["git", "-C", str(repo_abs), "add", ".gitkeep"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_abs), "commit",
+                 "--quiet", "--allow-empty",
+                 "-m", "agentcore: scaffold root"],
+                check=True, capture_output=True,
+            )
+    os.environ["AGENTCORE_REPO_ROOT"] = str(repo_abs)
 
     registry = AgentRegistry()
     registry.load_dir(settings.agents_dir)

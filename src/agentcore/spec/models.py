@@ -60,6 +60,40 @@ class KnowledgeBinding(BaseModel):
     code_scopes: list[str] = Field(default_factory=list)
 
 
+class ExecutorSpec(BaseModel):
+    """A pre-LLM command to run in a sandboxed worktree.
+
+    The runtime applies the developer's diffs to a temp git worktree,
+    then runs each declared executor inside it. Output (exit_code,
+    stdout/stderr tails) is merged into the handoff payload under
+    `<name>` so the agent's LLM call sees real tool output instead of
+    inventing pass/fail.
+
+    Declared in `<role>.agent.md` so each project owns its validation
+    pipeline — runtime stays generic, no per-language heuristics.
+
+    Example (in qa.agent.md):
+      executors:
+        - name: pytest
+          command: [pytest, -q]
+        - name: ruff
+          command: [ruff, check, .]
+        - name: typecheck
+          command: [mypy, .]
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str  # merged-payload key + a label for traces
+    command: list[str]  # exact argv; runs in worktree cwd, no shell
+    timeout_seconds: int = 600  # per-executor cap
+    optional: bool = True  # non-zero exit doesn't fail the hop
+    # If set, the runtime reads this file from the worktree after the
+    # command exits and parses it as JSON into the merged payload.
+    # Useful for `pytest --json-report-file=...` and similar.
+    artifact: str | None = None
+
+
 class ModelConfig(BaseModel):
     """Provider routing for this agent's LLM calls."""
 
@@ -93,11 +127,24 @@ class AgentSpec(BaseModel):
     soul: Soul
     contract: Contract = Field(default_factory=Contract)
     knowledge: KnowledgeBinding = Field(default_factory=KnowledgeBinding)
-    # Pre-LLM executors. Names registered in `agentcore.runtime.executors`
-    # (e.g. "pytest"). The runtime runs each before the LLM call and
-    # merges its structured result into the handoff payload, grounding
-    # the LLM in real tool output instead of inviting it to invent.
-    executors: list[str] = Field(default_factory=list)
+    # Pre-LLM executors. Each entry is either:
+    #   - a string naming a registered executor in
+    #     `agentcore.runtime.executors.EXECUTORS` (legacy form), or
+    #   - an inline `ExecutorSpec` declaring the exact command to run.
+    # Each runs in a temp git worktree with the developer's diffs
+    # already applied; structured output is merged into the handoff
+    # payload before the LLM call.
+    executors: list[ExecutorSpec | str] = Field(default_factory=list)
+
+    # When True, the runtime does a small "command discovery" LLM call
+    # BEFORE the main hop: it shows the agent the developer's diffs and
+    # asks for a single shell command that runs the relevant tests.
+    # The command must be on PATH (never installs); the runtime executes
+    # it in the sandbox, captures real pass/fail, and merges the result
+    # into the handoff payload as `test_run` for the main call. This
+    # lets agents (typically QA) choose the right runner by inspecting
+    # what was just written — no per-project config, no heuristics.
+    discovers_commands: bool = False
 
     # The body of the markdown file becomes the system prompt.
     system_prompt: str = ""

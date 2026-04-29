@@ -15,7 +15,9 @@ This keeps every step inspectable and human-cancellable.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import platform
 import re
 from pathlib import Path
 from typing import Any
@@ -122,23 +124,44 @@ class Runtime:
                 f"agent {spec.name!r} does not accept handoffs from {handoff.from_agent!r}"
             )
 
-        # 2. Pre-LLM executors (e.g. polyglot test runner). They run in
-        #    declaration order, each merging structured output into the
-        #    handoff payload so the LLM sees real tool results instead
-        #    of inventing them. The QA agent declares `executors: [tests]`
-        #    so its `test_run` field arrives populated, not imagined.
+        # 2. Pre-LLM phase. Two complementary mechanisms:
+        #
+        #    a) `discovers_commands: true` — the runtime does a small
+        #       LLM call asking the agent (given the diffs in payload)
+        #       what shell command runs the relevant tests. The chosen
+        #       command runs in a temp git worktree against the dev's
+        #       diffs; the structured result is merged as `test_run`.
+        #       This is how QA grounds itself without static config.
+        #    b) Static `executors:` — declared inline in <role>.agent.md
+        #       as `ExecutorSpec`s (or registered string names). Used
+        #       for fixed pipelines like "always run lint + typecheck"
+        #       regardless of what the dev produced.
+        new_payload = dict(handoff.payload)
+        if spec.discovers_commands:
+            disc = await self._discover_and_run(spec, handoff)
+            if disc:
+                new_payload.update(disc)
+                self._record(
+                    handoff.task_id, handoff.step, "discovery",
+                    spec.name,
+                    {"fields": list(disc.keys())},
+                )
         if spec.executors:
             from agentcore.runtime.executors import run_executor
 
-            new_payload = dict(handoff.payload)
-            for name in spec.executors:
-                merged = await run_executor(name, new_payload)
+            for entry in spec.executors:
+                merged = await run_executor(entry, new_payload)
                 if merged:
                     new_payload.update(merged)
+                    label = (
+                        entry.name if hasattr(entry, "name") else str(entry)
+                    )
                     self._record(
                         handoff.task_id, handoff.step, "executor",
-                        spec.name, {"name": name, "fields": list(merged.keys())},
+                        spec.name,
+                        {"name": label, "fields": list(merged.keys())},
                     )
+        if new_payload != handoff.payload:
             handoff = handoff.model_copy(update={"payload": new_payload})
 
         # 3. Payload validation
@@ -213,6 +236,135 @@ class Runtime:
     # ------------------------------------------------------------------
     # LLM call + batching
     # ------------------------------------------------------------------
+
+    async def _discover_and_run(
+        self, spec: AgentSpec, handoff: Handoff
+    ) -> dict[str, Any]:
+        """Self-discovery: ask the agent to propose 1-N candidate test
+        commands for the developer's diffs given the host OS, then try
+        each in turn until one runs cleanly (rc=0) or all exhaust.
+
+        The agent is told the host OS so it can pick sh / pwsh / native
+        tooling appropriately. Multiple candidates lets the agent hedge
+        when it isn't sure which runner the project wires up.
+
+        Returns `{"test_command": [...], "test_run": {...},
+        "test_attempts": [...]}`. Empty dict if no diffs or LLM bails.
+        """
+        from agentcore.runtime.sandbox import run_in_worktree
+
+        diffs = handoff.payload.get("diffs") or []
+        if not diffs:
+            return {}
+
+        # Compact the diffs into a sketch the LLM can scan quickly.
+        sketch: list[dict[str, Any]] = []
+        for d in diffs[:20]:
+            if not isinstance(d, dict):
+                continue
+            text = d.get("unified_diff") or ""
+            sketch.append({
+                "path": d.get("path"),
+                "preview": "\n".join(text.splitlines()[:40]),
+            })
+
+        host_label = f"{platform.system()} ({platform.machine()})"
+        sys_prompt = (
+            "Choose 1-3 candidate shell commands that run the tests "
+            "covering the developer's proposed diffs. The runtime will "
+            "try them in order until one exits cleanly (rc=0).\n\n"
+            f"Host OS: {host_label}. Pick commands appropriate for the "
+            "host — bash/sh on Linux/macOS, pwsh/cmd on Windows. Use "
+            "language-native tooling where applicable (pytest, go test, "
+            "cargo test, npm/pnpm/yarn test, mvn/gradle test, dotnet "
+            "test, ctest, etc.).\n\n"
+            "Constraints:\n"
+            "  - Each command's first arg MUST be on PATH already; the "
+            "runtime never installs anything.\n"
+            "  - If no test command is appropriate (e.g. docs-only "
+            'diff), respond with {"candidates": []}.\n'
+            "  - You may include a fallback or two — e.g. if pytest "
+            "isn't installed, try `python -m unittest discover`.\n\n"
+            "Reply with ONLY a JSON object:\n"
+            '{"candidates": [["arg0","arg1",...], ...], '
+            '"rationale": "<one sentence>"}. '
+            "No prose, no markdown fences, no <think> tags."
+        )
+        user_prompt = (
+            "Repository diffs (paths + previews):\n"
+            f"```json\n{json.dumps(sketch, indent=2)}\n```"
+        )
+        try:
+            resp = await asyncio.wait_for(
+                self.router.complete(
+                    [
+                        ChatMessage(role="system", content=sys_prompt),
+                        ChatMessage(role="user", content=user_prompt),
+                    ],
+                    spec.llm,
+                ),
+                timeout=180.0,
+            )
+        except Exception as exc:
+            log.warning("discovery.llm_failed", error=str(exc))
+            return {}
+
+        match = re.search(r"\{.*\}", resp.text, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+        candidates = data.get("candidates") or data.get("commands") or []
+        # Tolerant: also accept `command: [...]` (single) for back-compat.
+        if not candidates and isinstance(data.get("command"), list):
+            candidates = [data["command"]]
+        if not isinstance(candidates, list) or not candidates:
+            return {}
+        # Filter to well-formed argv lists.
+        candidates = [
+            list(c) for c in candidates
+            if isinstance(c, list) and c and all(isinstance(x, str) for x in c)
+        ]
+        if not candidates:
+            return {}
+
+        attempts: list[dict[str, Any]] = []
+        last_run: dict[str, Any] | None = None
+        winning_cmd: list[str] | None = None
+        for cmd in candidates:
+            try:
+                run = await run_in_worktree(
+                    list(cmd),
+                    diffs=diffs,
+                    repo_root=handoff.payload.get("repo_root"),
+                    timeout_seconds=600,
+                )
+            except Exception as exc:
+                run = {
+                    "executor_status": "error",
+                    "exit_code": -1,
+                    "stdout_tail": "",
+                    "stderr_tail": str(exc)[:500],
+                    "applied_files": [],
+                    "command": " ".join(cmd),
+                }
+            attempts.append({
+                "command": cmd,
+                "exit_code": run.get("exit_code"),
+                "executor_status": run.get("executor_status"),
+            })
+            last_run = run
+            if run.get("exit_code") == 0:
+                winning_cmd = cmd
+                break
+
+        return {
+            "test_command": winning_cmd or candidates[-1],
+            "test_run": last_run or {},
+            "test_attempts": attempts,
+        }
 
     async def _one_shot(self, spec: AgentSpec, handoff: Handoff) -> dict[str, Any]:
         """Render messages, call the LLM honouring SLA, parse JSON.
