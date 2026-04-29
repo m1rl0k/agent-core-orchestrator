@@ -425,7 +425,10 @@ async def _plan_async_body(
     # Mirror trace events to ~/.agentcore/traces/<chain-id>.jsonl so the
     # `agentcore tail <chain-id>` command can follow CLI-driven chains
     # without the orchestrator needing to be running.
-    traces = TraceLog(disk_dir=Path.home() / ".agentcore" / "traces")
+    traces = TraceLog(
+        disk_dir=Path.home() / ".agentcore" / "traces",
+        settings=settings,
+    )
 
     graph = KnowledgeGraph(settings=settings)
     try:

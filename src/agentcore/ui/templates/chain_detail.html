@@ -13,8 +13,45 @@
     {% else %}
       <span class="badge badge-running">running</span>
     {% endif %}
+    {% if not chain or chain.status in ('running', 'in_review', 'incomplete') %}
+    <button id="cancel-chain" class="outline small"
+            data-chain="{{ chain_id }}"
+            style="padding: 4px 12px; cursor: pointer">
+      Cancel
+    </button>
+    {% endif %}
     <a href="{{ url_for('ui-chains') }}" class="small muted">← all chains</a>
   </div>
+
+<script>
+(function () {
+  const btn = document.getElementById("cancel-chain");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    if (!confirm("Cancel chain " + btn.dataset.chain.slice(0, 12) + "…?")) return;
+    btn.disabled = true; btn.textContent = "cancelling…";
+    const project = new URLSearchParams(window.location.search).get("project");
+    const headers = {"Content-Type": "application/json"};
+    if (project) headers["X-Project-Id"] = project;
+    try {
+      const res = await fetch("/chains/" + btn.dataset.chain, {
+        method: "DELETE", headers,
+      });
+      if (res.ok) {
+        btn.textContent = "cancelled";
+        setTimeout(() => location.reload(), 800);
+      } else {
+        const t = await res.text();
+        btn.textContent = "failed: " + t.slice(0, 60);
+        btn.disabled = false;
+      }
+    } catch (e) {
+      btn.textContent = "error: " + e;
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
 </div>
 
 {% if chain and chain.status == 'failed' and chain.error %}
@@ -56,6 +93,110 @@
 </div>
 {% else %}
 <div class="empty">No hops recorded for this chain.</div>
+{% endif %}
+
+{% if review_history %}
+<section class="card">
+  <div class="card-title">
+    <h3>Review history ({{ review_history|length }} events)</h3>
+    <span class="muted small">why each round approved/rejected, and where it routed back</span>
+  </div>
+  {% for ev in review_history %}
+  {% if ev.kind == 'review_round' %}
+    <div style="margin: 16px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--pico-muted-border-color)">
+      <strong>round {{ ev.round }}</strong>
+      <span class="muted small">· {{ ev.verdicts }} verdicts</span>
+    </div>
+  {% elif ev.kind == 'verdict' %}
+    <div style="display: flex; gap: 12px; align-items: flex-start; padding: 4px 0">
+      <strong style="min-width: 100px">{{ ev.actor }}</strong>
+      {% if ev.approved %}
+        <span class="badge badge-done">✓ approved</span>
+      {% else %}
+        <span class="badge badge-failed">✗ rejected</span>
+      {% endif %}
+      <div style="flex: 1">
+        {% if ev.comments %}<div class="small">{{ ev.comments }}</div>{% endif %}
+        {% if ev.blockers %}
+        <ul class="muted small" style="margin: 4px 0 0 16px; padding: 0">
+          {% for b in ev.blockers %}<li>✗ {{ b }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+      {% if not ev.approved and ev.route_back_to %}
+        <span class="muted small">→ {{ ev.route_back_to }}</span>
+      {% endif %}
+    </div>
+  {% elif ev.kind == 'route_back' %}
+    <div class="muted small" style="padding: 6px 0; font-style: italic">
+      ↩ routing back to <strong>{{ ev.target }}</strong> with {{ ev.blockers }} blocker(s)
+    </div>
+  {% elif ev.kind == 'result' %}
+    <div style="margin-top: 12px; padding: 8px 12px; background: var(--pico-background-color); border-left: 3px solid var(--accent)">
+      <strong>★ result:</strong>
+      {% if ev.approved is true and ev.applied_count %}
+        <span style="color: var(--success)">approved · applied {{ ev.applied_count }} file(s)</span>
+      {% elif ev.approved is true %}
+        <span style="color: var(--warning)">approved · no diffs</span>
+      {% elif ev.approved is false %}
+        <span style="color: var(--warning)">blocked by review</span>
+      {% else %}
+        <span class="muted">finished</span>
+      {% endif %}
+    </div>
+  {% endif %}
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if chain and chain.files_touched %}
+<section class="card">
+  <div class="card-title">
+    <h3>Files touched ({{ chain.files_touched|length }})</h3>
+  </div>
+  <table>
+    <thead><tr><th>Path</th></tr></thead>
+    <tbody>
+      {% for f in chain.files_touched %}
+      <tr><td><code>{{ f }}</code></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if chain and chain.snippets_produced %}
+<section class="card">
+  <div class="card-title">
+    <h3>Snippets produced ({{ chain.snippets_produced|length }})</h3>
+    <span class="muted small">code excerpts the chain emitted</span>
+  </div>
+  {% for s in chain.snippets_produced[:25] %}
+  <details style="margin-bottom: 8px; padding: 8px 12px; background: var(--pico-background-color); border: 1px solid var(--pico-muted-border-color); border-radius: var(--radius)">
+    <summary style="cursor: pointer; list-style: none">
+      <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+        {% if s.role %}<span class="badge">{{ s.role }}</span>{% endif %}
+        {% if s.file %}<code class="small">{{ s.file }}</code>{% endif %}
+        {% if s.lines %}<span class="muted small">L{{ s.lines }}</span>{% endif %}
+        <span class="muted small" style="margin-left: auto">▾</span>
+      </div>
+      {% if s.intent %}
+      <div class="muted small" style="margin-top: 6px">{{ s.intent }}</div>
+      {% endif %}
+    </summary>
+    {% if s.content %}
+    <pre style="margin-top: 12px; font-size: 11px; max-height: 320px; overflow-y: auto; padding: 12px; background: var(--pico-card-background-color); border-radius: var(--radius)"><code>{{ s.content }}</code></pre>
+    {% else %}
+    <div class="muted small" style="margin-top: 8px">(no content captured)</div>
+    {% endif %}
+  </details>
+  {% endfor %}
+  {% if chain.snippets_produced|length > 25 %}
+  <div class="muted small" style="margin-top: 8px">
+    showing 25 of {{ chain.snippets_produced|length }}
+  </div>
+  {% endif %}
+</section>
 {% endif %}
 
 {% if in_flight %}

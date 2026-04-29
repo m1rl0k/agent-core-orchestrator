@@ -88,7 +88,7 @@ def build_app() -> FastAPI:
         )
 
     registry = AgentRegistry()
-    traces = TraceLog()
+    traces = TraceLog(settings=settings)
     router = LLMRouter(settings)
     from agentcore.state.idempotency import IdempotencyStore
     from agentcore.state.jobs import JobQueue

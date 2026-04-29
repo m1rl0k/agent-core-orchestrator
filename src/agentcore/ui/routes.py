@@ -9,10 +9,15 @@ the same auth/idempotency semantics.
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import structlog
+
+log = structlog.get_logger(__name__)
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -185,8 +190,15 @@ def mount_ui(  # type: ignore[no-untyped-def]
     @app.get("/ui/chains/{chain_id}", response_class=HTMLResponse, name="ui-chain-detail")
     async def ui_chain_detail(request: Request, chain_id: str) -> HTMLResponse:
         pid = _pid(request)
+        # First source: idempotency cache (HTTP-driven chains carry full
+        # hop arrays here). Fall back to reconstruction from the graph
+        # so CLI-driven chains (which never touch the idempotency cache)
+        # still render a useful detail view.
         chain = idem_cache.get("chain", chain_id, project_id=pid)
+        if chain is None:
+            chain = _chain_detail_from_graph(settings, chain_id, pid)
         in_flight = _chain_in_flight_jobs(job_queue, chain_id, project_id=pid)
+        review_history = _chain_review_history(chain_id)
         return _TEMPLATES.TemplateResponse(
             request,
             "chain_detail.html",
@@ -194,8 +206,9 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 request,
                 "chains",
                 chain_id=chain_id,
-                chain=chain,  # None if not in cache (running, mid-chain)
+                chain=chain,  # None if neither source has it
                 in_flight=in_flight,
+                review_history=review_history,
             ),
         )
 
@@ -412,6 +425,184 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
         cur.execute(sql, (project_id, project_id))
         row = cur.fetchone()
     return int(row[0] or 0) if row else 0
+
+
+def _chain_review_history(chain_id: str) -> list[dict[str, Any]]:
+    """Extract review-round verdicts and route-backs from the local
+    JSONL trace at ~/.agentcore/traces/<chain-id>.jsonl. Lets the UI
+    show WHY a chain stalled or got rejected — not just that it did.
+
+    Returns a list of `{round, agent, approved, comments, blockers,
+    route_back_to}` entries per verdict, plus synthetic entries for
+    `route_back` / `result` events.
+    """
+    from pathlib import Path as _P
+
+    path = _P.home() / ".agentcore" / "traces" / f"{chain_id}.jsonl"
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = evt.get("kind")
+                if kind not in ("verdict", "route_back", "result", "review_round"):
+                    continue
+                out.append({
+                    "kind": kind,
+                    "round": evt.get("step"),
+                    "actor": evt.get("actor"),
+                    "at": evt.get("at"),
+                    **(evt.get("detail") or {}),
+                })
+    except OSError:
+        return []
+    return out
+
+
+def _chain_detail_from_graph(  # type: ignore[no-untyped-def]
+    settings, chain_id: str, project_id: str
+) -> dict[str, Any] | None:
+    """Reconstruct a chain detail from the operational graph for chains
+    that never touched the idempotency cache (CLI runs).
+
+    Returns the same shape as an idempotency-stored chain:
+      {chain_id, status, hops: [{agent, status, output?}]}
+    """
+    import psycopg
+
+    task_id = f"task:{chain_id}"
+    try:
+        with (
+            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            conn.cursor() as cur,
+        ):
+            # The task node — gives us labels for status inference.
+            cur.execute(
+                "SELECT labels, last_seen FROM agentcore_graph_nodes "
+                "WHERE project_id = %s AND id = %s",
+                (project_id, task_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            labels, last_seen = row[0] or {}, row[1]
+            if "qa_passed" in labels or "positive" in labels:
+                status = "done"
+            elif "qa_failed" in labels:
+                status = "failed"
+            elif "dev_revised" in labels:
+                status = "in_review"
+            else:
+                status = "ran"
+
+            # Hops: agents that worked on this task, with the snippets
+            # they produced (a proxy for "output").
+            cur.execute(
+                """
+                SELECT
+                    replace(e.source, 'agent:', '') AS agent,
+                    n.id, n.attrs, n.labels
+                  FROM agentcore_graph_edges e
+                  LEFT JOIN agentcore_graph_nodes n
+                    ON n.project_id = e.project_id AND n.id = e.target
+                 WHERE e.project_id = %s
+                   AND e.target = %s
+                   AND e.relation = 'worked_on'
+                   AND e.source LIKE 'agent:%%'
+              ORDER BY agent
+                """,
+                (project_id, task_id),
+            )
+            agents_seen: list[str] = []
+            for agent, _nid, _attrs, _lbls in cur.fetchall() or []:
+                a = str(agent)
+                if a not in agents_seen:
+                    agents_seen.append(a)
+
+            # Snippets produced for this task — give the operator
+            # something to read in the chain detail view. Pull the
+            # actual content + role + intent + file path so the UI
+            # has something to show, not just opaque ids.
+            cur.execute(
+                """
+                SELECT
+                    n2.id,
+                    n2.attrs->>'file' AS file,
+                    n2.attrs->>'role' AS role,
+                    n2.attrs->>'intent' AS intent,
+                    n2.attrs->>'content' AS content,
+                    (n2.attrs->>'start')::int AS start_line,
+                    (n2.attrs->>'end')::int AS end_line,
+                    n2.kind
+                  FROM agentcore_graph_edges e
+                  JOIN agentcore_graph_nodes n2
+                    ON n2.project_id = e.project_id AND n2.id = e.target
+                 WHERE e.project_id = %s
+                   AND e.source = %s
+                   AND e.relation = 'produced'
+              ORDER BY n2.last_seen DESC
+                 LIMIT 50
+                """,
+                (project_id, task_id),
+            )
+            snippets = [
+                {
+                    "id": str(sid),
+                    "file": file_,
+                    "role": role,
+                    "intent": (intent or "")[:200],
+                    "content": (content or "")[:4000],
+                    "lines": (
+                        f"{start_line}-{end_line}"
+                        if start_line and end_line and start_line != end_line
+                        else (str(start_line) if start_line else "")
+                    ),
+                    "kind": k,
+                }
+                for sid, file_, role, intent, content, start_line, end_line, k
+                in cur.fetchall() or []
+            ]
+
+            # Files this task touched.
+            cur.execute(
+                """
+                SELECT replace(target, 'file:', '') AS path
+                  FROM agentcore_graph_edges
+                 WHERE project_id = %s AND source = %s AND relation = 'changed'
+                """,
+                (project_id, task_id),
+            )
+            files = [str(p) for (p,) in cur.fetchall() or []]
+
+        hops = [
+            {
+                "agent": a,
+                "status": "ok",
+                "output": None,
+                "delegate_to": None,
+            }
+            for a in agents_seen
+        ]
+        return {
+            "chain_id": chain_id,
+            "status": status,
+            "hops": hops,
+            "files_touched": files,
+            "snippets_produced": snippets,
+            "last_seen": _age(last_seen),
+            "_source": "graph",
+        }
+    except Exception as exc:
+        log.warning("ui.chain_from_graph_failed", error=str(exc))
+        return None
 
 
 def _agent_activity(  # type: ignore[no-untyped-def]
@@ -794,19 +985,19 @@ def _recent_chains(  # type: ignore[no-untyped-def]
             if cid in out:
                 continue  # idempotency entry wins (richer)
             lbls = labels if isinstance(labels, dict) else {}
-            # Infer status from any of the prf labels we know about.
+            # Infer status from PRF labels. None of these mean the
+            # chain is currently *executing* — these are post-mortem
+            # states inferred from labels written during the chain's
+            # lifecycle. The CLI / orchestrator process is long gone
+            # by the time the UI reads these.
             if "qa_passed" in lbls or "positive" in lbls:
-                status = "done"
+                status = "done"            # converged + tests passed
             elif "qa_failed" in lbls or "negative" in lbls:
-                status = "failed"
+                status = "failed"          # ran but tests failed
             elif "dev_revised" in lbls or "architect_revised" in lbls:
-                # Mid-flight revision was tagged but no terminal label
-                # — chain ran but didn't reach a clean approval.
-                status = "in_review"
+                status = "incomplete"      # entered review, never converged
             elif int(hop_count) > 0:
-                # No PRF label at all but at least one agent worked on
-                # it — the chain ran (just didn't tag terminal).
-                status = "ran"
+                status = "incomplete"      # ran some hops, never tagged terminal
             else:
                 status = "unknown"
             out[cid] = {

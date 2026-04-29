@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     # read; this is the bulk cleanup that keeps the table bounded.
     cleanup_interval_seconds: int = Field(900, alias="AGENTCORE_CLEANUP_INTERVAL_SECONDS")
     jobs_retention_days: int = Field(7, alias="AGENTCORE_JOBS_RETENTION_DAYS")
+    trace_retention_days: int = Field(14, alias="AGENTCORE_TRACE_RETENTION_DAYS")
 
     # Provider priority — comma-separated list. The orchestrator picks the first
     # provider in this list whose credentials are populated when an agent's
@@ -236,6 +237,7 @@ class Settings(BaseSettings):
     # pgvector under collection `wiki:<project>:<branch>` so every agent
     # loop can retrieve from it.
     enable_wiki: bool = Field(False, alias="AGENTCORE_ENABLE_WIKI")
+    wiki_persistent: bool = Field(True, alias="AGENTCORE_WIKI_PERSISTENT")
     wiki_root: Path = Field(Path(".agentcore/wiki"), alias="AGENTCORE_WIKI_ROOT")
     # Model the curator uses for ingest + lint. Cheap + fast is the right
     # call here since this is high-volume and the agent has well-defined

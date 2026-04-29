@@ -16,6 +16,7 @@ This keeps every step inspectable and human-cancellable.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import platform
 import re
