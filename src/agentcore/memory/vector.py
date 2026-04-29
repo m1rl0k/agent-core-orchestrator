@@ -8,29 +8,39 @@ Schema (single table, multi-tenant by `collection`):
     ref          TEXT NOT NULL,            -- e.g. "code:src/foo.py:42"
     content      TEXT NOT NULL,
     metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
-    embedding    vector(768) NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    embedding    vector(<dim>) NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(collection, ref)
   );
   CREATE INDEX IF NOT EXISTS idx_agentcore_chunks_collection
     ON agentcore_chunks(collection);
   CREATE INDEX IF NOT EXISTS idx_agentcore_chunks_embedding
     ON agentcore_chunks USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
+
+`<dim>` is determined at `init_schema(dim=...)` time so swapping in a
+different fastembed model (e.g. mxbai-large-v1, 1024-dim) does not require
+hand-editing DDL.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import psycopg
 from pgvector.psycopg import register_vector
 
-from agentcore.memory.embed import EMBED_DIM
+from agentcore.memory.embed import DEFAULT_MODEL, EMBED_DIM, embedding_dim_for_model
 from agentcore.settings import Settings, get_settings
 
-DDL = f"""
+
+def _build_ddl(dim: int) -> str:
+    return f"""
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS agentcore_chunks (
   id          BIGSERIAL PRIMARY KEY,
@@ -38,12 +48,22 @@ CREATE TABLE IF NOT EXISTS agentcore_chunks (
   ref         TEXT NOT NULL,
   content     TEXT NOT NULL,
   metadata    JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-  embedding   vector({EMBED_DIM}) NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  embedding   vector({dim}) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agentcore_chunks_collection_ref
+  ON agentcore_chunks(collection, ref);
 CREATE INDEX IF NOT EXISTS idx_agentcore_chunks_collection
   ON agentcore_chunks(collection);
+CREATE INDEX IF NOT EXISTS idx_agentcore_chunks_embedding
+  ON agentcore_chunks USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
 """
+
+
+# Backwards-compatible default DDL (Nomic-1.5 / 768-dim).
+DDL = _build_ddl(EMBED_DIM)
 
 
 @dataclass(slots=True)
@@ -54,18 +74,64 @@ class Hit:
     metadata: dict[str, Any]
 
 
+def _configure_conn(conn: psycopg.Connection) -> None:
+    register_vector(conn)
+
+
 class VectorStore:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self._pool: Any | None = None
+        self._pool_available = True
 
-    def _conn(self) -> psycopg.Connection:
-        conn = psycopg.connect(self.settings.pg_dsn, autocommit=True)
-        register_vector(conn)
-        return conn
+    def _ensure_pool(self) -> Any | None:
+        if not self._pool_available:
+            return None
+        if self._pool is None:
+            try:
+                from psycopg_pool import ConnectionPool
+            except ImportError:
+                self._pool_available = False
+                return None
+            self._pool = ConnectionPool(
+                conninfo=self.settings.pg_dsn,
+                min_size=1,
+                max_size=8,
+                kwargs={"autocommit": True},
+                configure=_configure_conn,
+                open=True,
+            )
+        return self._pool
 
-    def init_schema(self) -> None:
+    @contextmanager
+    def _conn(self) -> Iterator[psycopg.Connection]:
+        pool = self._ensure_pool()
+        if pool is None:
+            conn = psycopg.connect(self.settings.pg_dsn, autocommit=True)
+            try:
+                _configure_conn(conn)
+                yield conn
+            finally:
+                conn.close()
+            return
+        with pool.connection() as conn:
+            yield conn
+
+    def init_schema(self, dim: int | None = None) -> None:
+        """Create the chunks table at the requested embedding dimension.
+
+        When `dim` is None, defaults to the registered dim of
+        `settings.embed_model` (or the package default).
+        """
+        if dim is None:
+            try:
+                dim = embedding_dim_for_model(self.settings.embed_model or DEFAULT_MODEL)
+            except ValueError:
+                dim = EMBED_DIM
+        ddl = _build_ddl(dim)
         with self._conn() as conn, conn.cursor() as cur:
-            cur.execute(DDL)
+            cur.execute(ddl)
+            cur.execute("ANALYZE agentcore_chunks")
 
     def upsert(
         self,
@@ -77,7 +143,12 @@ class VectorStore:
             return 0
         sql = (
             "INSERT INTO agentcore_chunks (collection, ref, content, metadata, embedding) "
-            "VALUES (%s, %s, %s, %s::jsonb, %s)"
+            "VALUES (%s, %s, %s, %s::jsonb, %s) "
+            "ON CONFLICT (collection, ref) DO UPDATE SET "
+            "content = EXCLUDED.content, "
+            "metadata = EXCLUDED.metadata, "
+            "embedding = EXCLUDED.embedding, "
+            "updated_at = now()"
         )
         with self._conn() as conn, conn.cursor() as cur:
             for ref, content, meta, emb in items:
@@ -100,3 +171,8 @@ class VectorStore:
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM agentcore_chunks WHERE collection = %s", (collection,))
             return cur.rowcount
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None

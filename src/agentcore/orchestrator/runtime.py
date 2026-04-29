@@ -428,11 +428,51 @@ class Runtime:
 
     @staticmethod
     def _parse_json_block(text: str) -> dict[str, Any]:
-        """Models occasionally wrap JSON in ```json fences. Be lenient."""
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError(f"no JSON object found in model output: {text[:200]!r}")
-        return json.loads(match.group(0))
+        """Extract a valid JSON object from fenced or prose-wrapped output."""
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+        if fence:
+            try:
+                parsed = json.loads(fence.group(1))
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return parsed
+
+        candidates: list[str] = []
+        starts = [i for i, ch in enumerate(text) if ch == "{"]
+        for start in starts:
+            depth = 0
+            in_string = False
+            escaped = False
+            for end in range(start, len(text)):
+                ch = text[end]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[start : end + 1])
+                        break
+
+        for candidate in sorted(candidates, key=len, reverse=True):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError(f"no JSON object found in model output: {text[:200]!r}")
 
     @staticmethod
     def _infer_delegation(spec: AgentSpec, output: dict[str, Any]) -> str | None:

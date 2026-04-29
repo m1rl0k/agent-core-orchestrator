@@ -56,3 +56,6 @@ Thumbs.db
 
 # Postgres data dirs (when run locally without docker volumes)
 pgdata/
+/.omc
+/.context-engine
+/docs

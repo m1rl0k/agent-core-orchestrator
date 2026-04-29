@@ -13,10 +13,11 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 from agentcore.adapters.graphify import GraphifyAdapter
@@ -45,6 +46,12 @@ class RunRequest(BaseModel):
     max_hops: int = 6
 
 
+class HandoffRequest(BaseModel):
+    from_agent: str = "user"
+    to_agent: str
+    payload: dict[str, Any]
+
+
 class RunResponse(BaseModel):
     task_id: str
     hops: list[dict[str, Any]]
@@ -70,8 +77,8 @@ def build_app() -> FastAPI:
     registry = AgentRegistry()
     traces = TraceLog()
     router = LLMRouter(settings)
-    graph = KnowledgeGraph()
-    graph.load()  # restore prior snapshot if present
+    graph = KnowledgeGraph(settings=settings)
+    graph.load()  # initialize/load durable Postgres graph memory
     graphify = (
         GraphifyAdapter(repo_root=settings.graphify_repo_root, enabled=True)
         if settings.enable_graphify
@@ -83,6 +90,22 @@ def build_app() -> FastAPI:
         graph=graph, graphify=graphify, retriever=retriever,
     )
 
+    async def require_api_token(authorization: str | None = Header(default=None)) -> None:
+        if not settings.api_token:
+            return
+        expected = f"Bearer {settings.api_token}"
+        if authorization is None or not hmac.compare_digest(authorization, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="missing or invalid bearer token",
+            )
+
+    def save_graph_best_effort() -> None:
+        try:
+            graph.save()
+        except Exception:
+            return
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         stop = asyncio.Event()
@@ -92,6 +115,7 @@ def build_app() -> FastAPI:
         try:
             yield
         finally:
+            save_graph_best_effort()
             stop.set()
             watcher.cancel()
 
@@ -130,7 +154,7 @@ def build_app() -> FastAPI:
     async def capabilities() -> dict[str, Any]:
         return {name: cap.__dict__ for name, cap in detect_capabilities(settings).items()}
 
-    @app.post("/run", response_model=RunResponse)
+    @app.post("/run", response_model=RunResponse, dependencies=[Depends(require_api_token)])
     async def run(req: RunRequest) -> RunResponse:
         handoff = Handoff(
             task_id=new_task_id(),
@@ -156,20 +180,28 @@ def build_app() -> FastAPI:
             if not (req.chain and nxt):
                 break
             current = nxt
+        save_graph_best_effort()
         return RunResponse(task_id=handoff.task_id, hops=hops)
 
-    @app.post("/handoff", response_model=RunResponse)
-    async def handoff_one(handoff: Handoff) -> RunResponse:
+    @app.post("/handoff", response_model=RunResponse, dependencies=[Depends(require_api_token)])
+    async def handoff_one(req: HandoffRequest) -> RunResponse:
+        handoff = Handoff(
+            task_id=new_task_id(),
+            from_agent=req.from_agent,
+            to_agent=req.to_agent,
+            payload=req.payload,
+        )
         try:
             outcome, _ = await runtime.execute(handoff)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        save_graph_best_effort()
         return RunResponse(
             task_id=handoff.task_id,
             hops=[{"agent": outcome.agent, "status": outcome.status, "output": outcome.output}],
         )
 
-    @app.post("/signal")
+    @app.post("/signal", dependencies=[Depends(require_api_token)])
     async def receive_signal(sig: SignalIn) -> dict[str, Any]:
         # Signals route to Ops by convention; Ops decides whether to escalate.
         ops = registry.get("ops")
@@ -184,6 +216,7 @@ def build_app() -> FastAPI:
             outcome, _ = await runtime.execute(handoff)
         except HandoffRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        save_graph_best_effort()
         return {"task_id": handoff.task_id, "outcome": outcome.model_dump()}
 
     @app.get("/tasks/{task_id}/trace")

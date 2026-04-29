@@ -18,6 +18,19 @@ from agentcore.settings import Settings, get_settings
 
 EMBED_DIM = 768
 DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+SUPPORTED_EMBED_DIMS = {
+    DEFAULT_MODEL: EMBED_DIM,
+}
+
+
+def embedding_dim_for_model(model_name: str) -> int:
+    try:
+        return SUPPORTED_EMBED_DIMS[model_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported embedding model {model_name!r}; "
+            f"supported models: {', '.join(sorted(SUPPORTED_EMBED_DIMS))}"
+        ) from exc
 
 
 class Embedder:
@@ -34,6 +47,25 @@ class Embedder:
         self.settings = settings or get_settings()
         self.model_name = model or self.settings.embed_model or DEFAULT_MODEL
         self._engine: Any = TextEmbedding(model_name=self.model_name)
+        self._dim: int | None = None
+
+    @property
+    def dim(self) -> int:
+        """Embedding dimensionality for the configured model.
+
+        Uses the static registry where possible; otherwise probes the engine
+        with a one-shot embedding so unfamiliar models still work.
+        """
+        if self._dim is not None:
+            return self._dim
+        try:
+            self._dim = embedding_dim_for_model(self.model_name)
+            return self._dim
+        except ValueError:
+            # Unknown model: probe by embedding a tiny sentinel.
+            [vec] = list(self._engine.embed(["x"]))
+            self._dim = len(list(vec))
+            return self._dim
 
     async def aclose(self) -> None:
         # fastembed has no resources to release; defined for symmetry with

@@ -25,13 +25,12 @@ through a thin FastAPI orchestrator — universally, on any codebase, on any OS.
   flight tasks are pinned to the version they started with.
 - **Multi-provider LLM router.** Anthropic, AWS Bedrock, Azure OpenAI, z.ai.
   Per-agent provider/model in frontmatter.
-- **Hybrid RAG.** pgvector + Nomic-embed-text v1.5 + a NetworkX/Louvain
-  *team & task* graph (who handed off to whom, which tasks touched which
-  files, what the outcome was). Code-symbol traversal is delegated to
-  **graphify** — a native-Python tree-sitter + NetworkX engine — and its
-  `impact()` returns are merged back into the operational graph after every
-  agent hop. Over time, Louvain on the merged graph clusters task families
-  with the symbol neighbourhoods they touch.
+- **Hybrid RAG.** Postgres stores both pgvector code/doc chunks and durable
+  graph tables for agent/task/file/symbol memory. NetworkX remains the
+  in-process compute layer for Louvain/community detection and graphify
+  subgraph ingestion. Code-symbol traversal is delegated to **graphify** —
+  feature name — via the `graphifyy` Python package, and its `impact()`
+  returns are merged back into the operational graph after every agent hop.
 - **Host-credentialed integrations.** Optional GitHub / AWS / Azure adapters
   ride on the host's existing `gh` / `aws` / `az` CLIs — agentcore never
   asks for credentials.
@@ -147,9 +146,9 @@ See [`docs/SPEC.md`](docs/SPEC.md) for the full spec.
 
                     ┌────────────────────┐
                     │  Memory & RAG      │
-                    │  pgvector +        │
-                    │  Nomic-embed-1.5 + │
-                    │  NetworkX/Louvain  │
+                    │  Postgres graph    │
+                    │  tables + pgvector │
+                    │  + NetworkX compute│
                     └────────────────────┘
 ```
 
@@ -169,14 +168,16 @@ See [`docs/SPEC.md`](docs/SPEC.md) for the full spec.
 ## Multi-project & sandboxing
 
 - **One orchestrator, many projects:** point each project's `.env` at a
-  different `AGENTCORE_AGENTS_DIR` and `PGDATABASE`. Or run a separate
-  orchestrator per project on different ports.
+  different `AGENTCORE_AGENTS_DIR` and `PGDATABASE` so vector chunks and
+  graph memory are isolated per project. Or run a separate orchestrator per
+  project on different ports.
 - **Sandbox modes:** `AGENTCORE_SANDBOX_MODE=host` (default) runs agent
   shell-outs on the orchestrator host. `=docker` wraps them in `docker exec`
   against `AGENTCORE_SANDBOX_IMAGE`. The orchestrator itself can run on host
   *or* in a container — independently.
-- **Always-on infra:** `postgres` (with the pgvector volume) is the only
-  service that *must* be containerised in dev.
+- **Always-on infra:** `postgres` is the only service that *must* be
+  containerised in dev. It hosts pgvector chunks plus durable graph nodes,
+  edges, labels, and community assignments.
 
 ---
 
@@ -203,9 +204,10 @@ When enabled, Ops can:
 
 ## Code-graph integration
 
-**graphify** is the in-process code knowledge engine: native-Python tree-sitter
-+ NetworkX (the same stack as our operational graph), so subgraphs compose
-without IPC.
+**graphify** is the in-process code knowledge feature; the Python dependency is
+`graphifyy`. It uses native-Python tree-sitter + NetworkX, so subgraphs compose
+with our NetworkX compute mirror without IPC, then persist through Postgres
+graph tables.
 
 The enrichment loop:
 
@@ -227,7 +229,8 @@ KnowledgeGraph
 
 After enough tasks, `agent:Architect` ↔ `task:T*` ↔ `file:src/auth/**` ↔
 `symbol:OAuth.*` form a Louvain community — the team's institutional memory
-of "this is the auth area".
+of "this is the auth area". The durable source of truth is Postgres; NetworkX
+is used for local graph algorithms and graphify subgraph normalization.
 
 ---
 

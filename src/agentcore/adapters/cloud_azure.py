@@ -48,7 +48,7 @@ class AzureAdapter(Adapter):
             name = alert.get("name", "unknown")
             yield Signal(
                 id=f"azure:{name}",
-                source="datadog" if False else "cloudwatch",  # stays in same router lane
+                source="azure",
                 kind="alert_fired",
                 severity="error",
                 target=name,

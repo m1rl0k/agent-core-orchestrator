@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     )
 
     # Server
-    host: str = Field("0.0.0.0", alias="AGENTCORE_HOST")
+    host: str = Field("127.0.0.1", alias="AGENTCORE_HOST")
+    api_token: str | None = Field(None, alias="AGENTCORE_API_TOKEN")
     port: int = Field(8088, alias="AGENTCORE_PORT")
     log_level: str = Field("info", alias="AGENTCORE_LOG_LEVEL")
 

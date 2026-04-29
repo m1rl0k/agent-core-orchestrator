@@ -8,6 +8,7 @@ handoff.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -16,6 +17,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agentcore.contracts.domain import DOMAIN_TYPES, PRIMITIVE_TYPES
 from agentcore.spec.models import IOField
+
+_LIST_TYPE_RE = re.compile(r"^list\[(\w+)\]$")
+_DICT_TYPE_RE = re.compile(r"^dict\[str,\s*(\w+)\]$")
+_PRIMITIVE_PY: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "int": int,
+    "float": (int, float),
+    "bool": bool,
+    "dict": dict,
+    "list": list,
+}
 
 
 def new_task_id() -> str:
@@ -115,17 +127,58 @@ class ContractViolation(ValueError):
         )
 
 
+def _check_inner(inner: str, value: Any) -> str | None:
+    """Validate `value` against a primitive or domain type name."""
+    if inner in PRIMITIVE_TYPES:
+        py_type = _PRIMITIVE_PY[inner]
+        if not isinstance(value, py_type):
+            return f"expected {inner}, got {type(value).__name__}"
+        return None
+    model = DOMAIN_TYPES.get(inner)
+    if model is None:
+        return f"unknown type {inner!r}"
+    try:
+        model.model_validate(value)
+    except ValidationError as exc:
+        return f"{exc.errors(include_url=False)}"
+    return None
+
+
 def _check_field(field: IOField, value: Any) -> str | None:
     """Return None on success, error string on failure."""
+    # Parametric list[<inner>] — validate every element.
+    list_match = _LIST_TYPE_RE.match(field.type)
+    if list_match:
+        if not isinstance(value, list):
+            return (
+                f"field {field.name!r}: expected list, got {type(value).__name__}"
+            )
+        inner = list_match.group(1)
+        for i, item in enumerate(value):
+            err = _check_inner(inner, item)
+            if err:
+                return f"field {field.name!r}[{i}]: {err}"
+        return None
+
+    # Parametric dict[str, <inner>] — validate every value (keys must be str).
+    # TODO: extend to non-str keys when a real use case emerges.
+    dict_match = _DICT_TYPE_RE.match(field.type)
+    if dict_match:
+        if not isinstance(value, dict):
+            return (
+                f"field {field.name!r}: expected dict, got {type(value).__name__}"
+            )
+        inner = dict_match.group(1)
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return f"field {field.name!r}: dict keys must be str, got {type(key).__name__}"
+            err = _check_inner(inner, item)
+            if err:
+                return f"field {field.name!r}[{key!r}]: {err}"
+        return None
+
     if field.type in PRIMITIVE_TYPES:
-        py_type = {
-            "string": str,
-            "int": int,
-            "float": (int, float),
-            "bool": bool,
-            "dict": dict,
-            "list": list,
-        }[field.type]
+        py_type = _PRIMITIVE_PY[field.type]
         if not isinstance(value, py_type):
             return f"field {field.name!r}: expected {field.type}, got {type(value).__name__}"
         return None

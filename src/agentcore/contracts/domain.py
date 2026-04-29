@@ -140,6 +140,7 @@ SignalSource = Literal[
     "github_pr",
     "github_pipeline",
     "cloudwatch",
+    "azure",
     "sentry",
     "datadog",
     "scheduled_scan",

@@ -205,7 +205,7 @@ async def _plan_async(brief: str, chain: bool, max_hops: int) -> None:
 
     router = LLMRouter(settings)
     traces = TraceLog()
-    graph = KnowledgeGraph()
+    graph = KnowledgeGraph(settings=settings)
     graph.load()
     graphify = (
         GraphifyAdapter(repo_root=settings.graphify_repo_root, enabled=True)
