@@ -39,6 +39,29 @@ through a thin FastAPI orchestrator — universally, on any codebase, on any OS.
   always in a container. Sandbox agent shell-outs in `host` or `docker` mode.
 - **Self-maintaining.** Optional triggers (webhooks, scheduled scans) feed
   Signals to Ops, which can escalate to Architect → Dev → QA autonomously.
+- **Durable chains.** `/run` with `durable: true` enqueues each hop as a
+  Postgres job; mid-hop failures are reclaimed by the next worker via the
+  jobs table's `lock_until` path. State survives orchestrator restarts.
+- **Idempotency keys.** `Idempotency-Key` header on `/run`, `/handoff`,
+  `/signal`, `/wiki/refresh` collapses duplicate webhook deliveries to a
+  single execution. Backed by a Postgres TTL store with in-memory fallback.
+- **Living wiki.** Optional curator role (`agents/wikist.agent.md`) keeps a
+  markdown wiki of the codebase under `.agentcore/wiki/<project>/<branch>/`,
+  indexed in pgvector under `wiki:<project>:<branch>` so every other agent
+  retrieves wiki context at runtime. Mirrors out to Claude Code skills,
+  Copilot prompts, and Cursor rules.
+- **Multi-tenant.** `project_id` is a hard boundary on idempotency, jobs,
+  and graph state. `X-Project-Id` header overrides the orchestrator's
+  default `project_name` per request.
+- **Schema migrations.** Alembic at `migrations/`; `agentcore migrate
+  upgrade head` applies them. Inline `init_schema()` calls remain as a dev
+  fallback; the two paths use `CREATE TABLE IF NOT EXISTS` and don't
+  conflict.
+- **SLA + chain timeout.** Per-agent `sla_seconds` is enforced via
+  `asyncio.wait_for` around each LLM call. `AGENTCORE_MAX_CHAIN_SECONDS`
+  caps the entire chain. Both are wall-clock budgets — no token clamping.
+- **Devcontainer.** `.devcontainer/` mounts the workspace and starts the
+  existing Postgres compose service so integration tests have a real DB.
 
 ---
 
@@ -241,6 +264,66 @@ is used for local graph algorithms and graphify subgraph normalization.
   hooks that POST tool-use events to the orchestrator's `/signal`.
 - For Copilot / Cursor: the same `agent.md` files are picked up if they read
   `AGENTS.md`-style roles. The unknown frontmatter is ignored.
+
+---
+
+## What it's used for
+
+Some shapes the codebase fits. None of these are configured by default —
+each is just a particular wiring of the existing primitives.
+
+- **Internal SDLC automation.** Architect/Developer/QA/Ops chain triggered
+  by `agentcore plan ...` or webhooks. Wiki keeps module docs in sync.
+- **Incident response.** Ops consumes Signals from CloudWatch / GitHub
+  workflow failures, decides between acknowledge and escalate-to-Architect.
+  Idempotency stops duplicate alerts from re-paging.
+- **Codebase knowledge management.** Curator-maintained wiki under
+  `.agentcore/wiki/`, mirrored to Claude/Copilot/Cursor surfaces. Agents
+  read from it on every loop, so the team's docs and the team's AI share
+  one source of truth.
+- **Multi-project platform.** One orchestrator, N projects via
+  `X-Project-Id`. Idempotency, jobs, and graph state are partitioned per
+  project; `agents/` directory and `wiki_root` can also be per-project via
+  env overrides.
+- **Long-running autonomous loops.** `/run` with `durable: true` enqueues
+  each hop as a job; orchestrator restarts mid-hop are reclaimed by the
+  next worker.
+- **Open-source maintenance.** GitHub adapter watches issues/PRs, Architect
+  drafts triage, Developer drafts patches, Ops opens the PR.
+- **Polyglot codebase agent.** Graphify covers Python/TS/Go/Rust/etc; the
+  four shipped roles are language-agnostic.
+
+What it isn't a fit for: real-time / sub-second latency, single-shot
+prompting (curl + jq is fine), or pure data-pipeline ETL where the LLM
+is overhead (use Dagster/Airflow).
+
+---
+
+## Endpoints
+
+```
+GET  /healthz              liveness + agent count
+GET  /agents               registered specs
+GET  /capabilities         host capability matrix (gh, aws, az)
+POST /run                  start a chain (sync) or enqueue durable
+POST /handoff              drive one explicit hop
+POST /signal               accept an external Signal
+GET  /tasks/{id}/trace     full trace for a task
+GET  /chains/{id}          status + result of a durable chain
+```
+
+Wiki endpoints (when `AGENTCORE_ENABLE_WIKI=true`):
+
+```
+GET  /wiki                 catalog
+GET  /wiki/{path}          one page (markdown + frontmatter)
+GET  /wiki/search?q=...    semantic search across the wiki collection
+POST /wiki/refresh         enqueue seed/incremental/lint refresh
+```
+
+Mutating endpoints accept `Idempotency-Key` and `X-Project-Id` headers.
+When `AGENTCORE_API_TOKEN` is set, mutating endpoints require
+`Authorization: Bearer <token>`.
 
 ---
 
