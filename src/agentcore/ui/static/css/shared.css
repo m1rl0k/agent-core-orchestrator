@@ -178,11 +178,11 @@ th {
   text-transform: lowercase;
   letter-spacing: 0.02em;
 }
-.badge-ok, .badge-done, .badge-running, .badge-ready {
+.badge-ok, .badge-done, .badge-running, .badge-ready, .badge-ran {
   background: rgba(22, 163, 74, 0.15);
   color: var(--success);
 }
-.badge-queued, .badge-pending {
+.badge-queued, .badge-pending, .badge-incomplete {
   background: rgba(245, 158, 11, 0.15);
   color: var(--warning);
 }

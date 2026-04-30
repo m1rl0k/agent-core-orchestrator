@@ -136,6 +136,16 @@
   const edges = data.edges
     .map(e => ({ s: byId[e.source], t: byId[e.target], relation: e.relation, weight: e.weight }))
     .filter(e => e.s && e.t);
+  const presentKinds = new Set(nodes.map(n => n.kind));
+  // Old filter state can make prior projects render as a blank graph.
+  // Drop stale kinds, and if every present kind is hidden, fail open.
+  for (const kind of [...hidden]) {
+    if (!presentKinds.has(kind)) hidden.delete(kind);
+  }
+  if (nodes.length > 0 && [...presentKinds].every(kind => hidden.has(kind))) {
+    hidden.clear();
+  }
+  localStorage.setItem(FILTER_KEY, JSON.stringify([...hidden]));
 
   // Force-directed layout — 150 ticks.
   for (let step = 0; step < 150; step++) {

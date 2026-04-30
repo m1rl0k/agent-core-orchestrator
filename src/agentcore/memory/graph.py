@@ -36,17 +36,19 @@ from agentcore.state.db import pg_conn
 
 GRAPH_DDL = """
 CREATE TABLE IF NOT EXISTS agentcore_graph_nodes (
-  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT 'default',
+  id TEXT NOT NULL,
   kind TEXT NOT NULL,
   attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
   labels JSONB NOT NULL DEFAULT '{}'::jsonb,
   first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_nodes_kind
-  ON agentcore_graph_nodes(kind);
+  ON agentcore_graph_nodes(project_id, kind);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_nodes_attrs_gin
   ON agentcore_graph_nodes USING GIN(attrs);
@@ -56,8 +58,9 @@ CREATE INDEX IF NOT EXISTS idx_agentcore_graph_nodes_labels_gin
 
 CREATE TABLE IF NOT EXISTS agentcore_graph_edges (
   id BIGSERIAL PRIMARY KEY,
-  source TEXT NOT NULL REFERENCES agentcore_graph_nodes(id) ON DELETE CASCADE,
-  target TEXT NOT NULL REFERENCES agentcore_graph_nodes(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL DEFAULT 'default',
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
   relation TEXT NOT NULL,
   weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
   active_weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
@@ -66,17 +69,21 @@ CREATE TABLE IF NOT EXISTS agentcore_graph_edges (
   first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(source, target, relation)
+  FOREIGN KEY (project_id, source)
+    REFERENCES agentcore_graph_nodes(project_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id, target)
+    REFERENCES agentcore_graph_nodes(project_id, id) ON DELETE CASCADE,
+  UNIQUE(project_id, source, target, relation)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_edges_source
-  ON agentcore_graph_edges(source);
+  ON agentcore_graph_edges(project_id, source);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_edges_target
-  ON agentcore_graph_edges(target);
+  ON agentcore_graph_edges(project_id, target);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_edges_relation
-  ON agentcore_graph_edges(relation);
+  ON agentcore_graph_edges(project_id, relation);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_edges_last_seen
   ON agentcore_graph_edges(last_seen DESC);
@@ -89,16 +96,19 @@ CREATE INDEX IF NOT EXISTS idx_agentcore_graph_edges_attrs_gin
 
 CREATE TABLE IF NOT EXISTS agentcore_graph_communities (
   id BIGSERIAL PRIMARY KEY,
-  node_id TEXT NOT NULL REFERENCES agentcore_graph_nodes(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL DEFAULT 'default',
+  node_id TEXT NOT NULL,
   community_id INTEGER NOT NULL,
   detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   community_size INTEGER NOT NULL,
   mean_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-  community_type TEXT NOT NULL DEFAULT 'active'
+  community_type TEXT NOT NULL DEFAULT 'active',
+  FOREIGN KEY (project_id, node_id)
+    REFERENCES agentcore_graph_nodes(project_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_communities_node
-  ON agentcore_graph_communities(node_id);
+  ON agentcore_graph_communities(project_id, node_id);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_communities_detected
   ON agentcore_graph_communities(detected_at DESC);
@@ -108,6 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_agentcore_graph_communities_type
 
 CREATE TABLE IF NOT EXISTS agentcore_graph_events (
   id BIGSERIAL PRIMARY KEY,
+  project_id TEXT NOT NULL DEFAULT 'default',
   task_id TEXT,
   actor TEXT NOT NULL,
   action TEXT NOT NULL,
@@ -117,7 +128,10 @@ CREATE TABLE IF NOT EXISTS agentcore_graph_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_task
-  ON agentcore_graph_events(task_id);
+  ON agentcore_graph_events(project_id, task_id);
+
+CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_project
+  ON agentcore_graph_events(project_id);
 
 CREATE INDEX IF NOT EXISTS idx_agentcore_graph_events_actor
   ON agentcore_graph_events(actor);
@@ -807,16 +821,19 @@ class KnowledgeGraph:
             for node in members:
                 rows.append((node, cid, len(members), round(mean_confidence, 3), ctype))
 
-        with self._conn() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM agentcore_graph_communities")
+        with self._conn() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM agentcore_graph_communities WHERE project_id = %s",
+                (self.project_id,),
+            )
             for row in rows:
                 cur.execute(
                     """
                     INSERT INTO agentcore_graph_communities
-                      (node_id, community_id, community_size, mean_confidence, community_type)
-                    VALUES (%s, %s, %s, %s, %s)
+                      (project_id, node_id, community_id, community_size, mean_confidence, community_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
-                    row,
+                    (self.project_id, *row),
                 )
 
     def save(self) -> None:

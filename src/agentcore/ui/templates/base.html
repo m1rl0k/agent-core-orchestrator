@@ -27,7 +27,7 @@
       {% endif %}
     </nav>
     <div class="row">
-      <form method="get" style="margin: 0">
+      <form method="get" action="{{ project_switch_url }}" style="margin: 0">
         <select
           name="project"
           onchange="this.form.submit()"
@@ -36,7 +36,9 @@
           title="project_id — pick a tenant"
         >
           {% for p in projects %}
-            <option value="{{ p }}" {% if p == project %}selected{% endif %}>{{ p }}</option>
+            <option value="{{ p }}" {% if p == project %}selected{% endif %}>
+              {% if p == "__all__" %}All projects{% else %}{{ p }}{% endif %}
+            </option>
           {% endfor %}
         </select>
       </form>

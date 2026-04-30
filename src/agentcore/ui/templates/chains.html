@@ -14,13 +14,14 @@
   {% if chains %}
   <table>
     <thead>
-      <tr><th>Chain ID</th><th>Status</th><th>Hops</th><th>Last agent</th><th>Updated</th></tr>
+      <tr>{% if project == "__all__" %}<th>Project</th>{% endif %}<th>Chain ID</th><th>Status</th><th>Hops</th><th>Last agent</th><th>Updated</th></tr>
     </thead>
     <tbody>
       {% for c in chains %}
       <tr>
+        {% if project == "__all__" %}<td><code>{{ c.project_id }}</code></td>{% endif %}
         <td>
-          <a href="/ui/chains/{{ c.chain_id }}{{ project_qs }}" class="mono small" style="text-decoration: none">
+          <a href="/ui/chains/{{ c.chain_id }}?project={{ c.project_id if project == '__all__' else project }}" class="mono small" style="text-decoration: none">
             <code>{{ c.chain_id[:16] }}…</code>
           </a>
         </td>

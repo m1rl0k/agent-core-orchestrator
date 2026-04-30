@@ -72,7 +72,7 @@
               <td><code>{{ t.chain_id[:12] }}…</code></td>
               <td class="muted small nowrap">{{ t.updated_at }}</td>
               <td>
-                <a class="small" href="{{ url_for('ui-chain-detail', chain_id=t.chain_id) }}{% if request.query_params.get('project') %}?project={{ request.query_params.get('project') }}{% endif %}">open →</a>
+                <a class="small" href="{{ url_for('ui-chain-detail', chain_id=t.chain_id) }}{{ project_qs }}">open →</a>
               </td>
             </tr>
             {% endfor %}

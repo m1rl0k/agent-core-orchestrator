@@ -24,6 +24,7 @@
   <table>
     <thead>
       <tr>
+        {% if project == "__all__" %}<th>Project</th>{% endif %}
         <th>ID</th>
         <th>Kind</th>
         <th>Status</th>
@@ -35,7 +36,16 @@
     <tbody>
       {% for j in jobs %}
       <tr>
-        <td><code>{{ j.id }}</code></td>
+        {% if project == "__all__" %}<td><code>{{ j.project_id }}</code></td>{% endif %}
+        <td>
+          {% if j.chain_id %}
+            <a href="{{ url_for('ui-chain-detail', chain_id=j.chain_id) }}?project={{ j.project_id if project == '__all__' else project }}" class="mono small" style="text-decoration: none">
+              <code>{{ j.id }}</code>
+            </a>
+          {% else %}
+            <code>{{ j.id }}</code>
+          {% endif %}
+        </td>
         <td><code>{{ j.kind }}</code></td>
         <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
         <td class="mono">{{ j.attempts }}/{{ j.max_attempts }}</td>
@@ -67,7 +77,11 @@
         <td><code>{{ j.kind }}</code></td>
         <td class="small truncate">{{ j.error or '—' }}</td>
         <td class="muted small nowrap">{{ j.finished_at or '—' }}</td>
-        <td><a href="/jobs/{{ j.id }}/retry" role="button" class="outline small">Retry</a></td>
+        <td>
+          <form method="post" action="{{ url_for('ui-job-retry', job_id=j.id) }}{{ project_qs }}" style="margin: 0">
+            <button class="outline small" style="padding: 2px 10px">Retry</button>
+          </form>
+        </td>
       </tr>
       {% endfor %}
     </tbody>

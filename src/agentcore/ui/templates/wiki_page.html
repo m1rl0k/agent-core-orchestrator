@@ -5,7 +5,7 @@
   <div>
     <h1>{{ page.title or page.rel }}</h1>
     <p class="subtitle">
-      <a href="{{ url_for('ui-wiki') }}{% if request.query_params.get('project') %}?project={{ request.query_params.get('project') }}{% endif %}">
+      <a href="{{ url_for('ui-wiki') }}{{ project_qs }}">
         ← all pages
       </a>
       · <code>{{ page.rel }}</code>

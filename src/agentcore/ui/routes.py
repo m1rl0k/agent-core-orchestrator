@@ -34,6 +34,11 @@ _TEMPLATES = Jinja2Templates(directory=str(_HERE / "templates"))
 # (project_id, fn_name) so multi-tenant queries don't cross.
 _CACHE_TTL = 3.0
 _CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
+ALL_PROJECTS = "__all__"
+
+
+def _is_all_projects(project_id: str | None) -> bool:
+    return project_id in {ALL_PROJECTS, "all", "*"}
 
 
 def _cached(key: tuple[str, str], loader):  # type: ignore[no-untyped-def]
@@ -81,10 +86,10 @@ def mount_ui(  # type: ignore[no-untyped-def]
         switch tenants from the UI without restarting the server."""
         q = request.query_params.get("project")
         if q:
-            return q
+            return ALL_PROJECTS if _is_all_projects(q) else q
         h = request.headers.get("x-project-id")
         if h:
-            return h
+            return ALL_PROJECTS if _is_all_projects(h) else h
         return settings.project_name
 
     def _project_qs(request: Request, pid: str) -> str:
@@ -110,6 +115,7 @@ def mount_ui(  # type: ignore[no-untyped-def]
             "active": active,
             "project": pid,
             "project_qs": _project_qs(request, pid),
+            "project_switch_url": request.url.path,
             "projects": projects,
             "wiki_enabled": settings.enable_wiki,
             **extra,
@@ -274,13 +280,57 @@ def mount_ui(  # type: ignore[no-untyped-def]
             _ctx(request, "jobs", jobs=jobs, dead_letter=dead_letter, counts=counts),
         )
 
+    @app.post("/ui/jobs/{job_id}/retry", include_in_schema=False, name="ui-job-retry")
+    async def ui_job_retry(request: Request, job_id: int) -> RedirectResponse:
+        pid = _pid(request)
+        job_queue.retry_dead_letter(job_id, project_id=pid)
+        return RedirectResponse(
+            url=f"{request.url_for('ui-jobs')}{_project_qs(request, pid)}",
+            status_code=303,
+        )
+
     if settings.enable_wiki and wiki_storage is not None:
+        def _wiki_storage_for_project(  # type: ignore[no-untyped-def]
+            project_id: str, branch: str | None = None
+        ):
+            target_branch = branch or wiki_storage.branch
+            if (
+                getattr(wiki_storage, "project", None) == project_id
+                and getattr(wiki_storage, "branch", None) == target_branch
+            ):
+                return wiki_storage
+            from agentcore.wiki.storage import WikiStorage
+
+            return WikiStorage(
+                wiki_storage.wiki_root,
+                project_id,
+                target_branch,
+                settings=wiki_storage.settings,
+            )
+
         @app.get("/ui/wiki", response_class=HTMLResponse, name="ui-wiki")
         async def ui_wiki(request: Request) -> HTMLResponse:
-            pages = [
-                {"rel": p.rel, "title": p.title, "sources": p.sources}
-                for p in wiki_storage.walk()
-            ]
+            pid = _pid(request)
+            if _is_all_projects(pid):
+                pages = _all_wiki_pages(settings, wiki_storage)
+                root = str(wiki_storage.wiki_root)
+                branch = "*"
+            else:
+                storage = _wiki_storage_for_project(
+                    pid, request.query_params.get("branch")
+                )
+                pages = [
+                    {
+                        "project_id": pid,
+                        "branch": storage.branch,
+                        "rel": p.rel,
+                        "title": p.title,
+                        "sources": p.sources,
+                    }
+                    for p in storage.walk()
+                ]
+                root = str(storage.root)
+                branch = storage.branch
             total_sources = sum(len(p["sources"]) for p in pages)
             return _TEMPLATES.TemplateResponse(
                 request,
@@ -289,10 +339,10 @@ def mount_ui(  # type: ignore[no-untyped-def]
                     request,
                     "wiki",
                     pages=pages,
-                    project=settings.project_name,
-                    root=str(wiki_storage.root),
-                    branch=wiki_storage.branch,
+                    root=root,
+                    branch=branch,
                     total_sources=total_sources,
+                    project_switch_url=str(request.url_for("ui-wiki")),
                 ),
             )
 
@@ -304,7 +354,10 @@ def mount_ui(  # type: ignore[no-untyped-def]
         async def ui_wiki_page(request: Request, rel: str) -> HTMLResponse:
             from fastapi import HTTPException as _HTTPException
 
-            page = wiki_storage.read(rel)
+            storage = _wiki_storage_for_project(
+                _pid(request), request.query_params.get("branch")
+            )
+            page = storage.read(rel)
             if page is None:
                 raise _HTTPException(status_code=404, detail=f"page {rel!r} not found")
             # Render the markdown body to HTML using markdown-it-py
@@ -331,6 +384,7 @@ def mount_ui(  # type: ignore[no-untyped-def]
                     "wiki",
                     page=page,
                     rendered_html=rendered_html,
+                    project_switch_url=str(request.url_for("ui-wiki")),
                 ),
             )
 
@@ -344,32 +398,34 @@ def _known_projects(settings) -> list[str]:  # type: ignore[no-untyped-def]
     """All project_ids that have state anywhere in the DB. Populates the
     header switcher so an operator can jump between tenants without
     knowing the names ahead of time. Best-effort; empty on DB miss."""
-    sql = """
-    SELECT DISTINCT project_id FROM agentcore_jobs
-    UNION
-    SELECT DISTINCT project_id FROM agentcore_idempotency
-    UNION
-    SELECT DISTINCT project_id FROM agentcore_graph_nodes
-    UNION
-    SELECT DISTINCT project_id FROM agentcore_graph_edges
-    UNION
-    SELECT DISTINCT project_id FROM agentcore_traces
-    ORDER BY 1
-    """
+    tables = (
+        "agentcore_jobs",
+        "agentcore_idempotency",
+        "agentcore_graph_nodes",
+        "agentcore_graph_edges",
+        "agentcore_traces",
+        "agentcore_wiki_pages",
+    )
+    found: set[str] = set()
     try:
         with (
             pg_conn(settings, timeout=2.0) as conn,
             conn.cursor() as cur,
         ):
-            cur.execute(sql)
-            found = [str(r[0]) for r in cur.fetchall() or []]
+            for table in tables:
+                with contextlib.suppress(Exception):
+                    cur.execute(f"SELECT DISTINCT project_id FROM {table}")
+                    found.update(str(r[0]) for r in cur.fetchall() or [])
     except Exception:
-        found = []
+        found = set()
     # Always include the server default so the switcher renders even
     # on a fresh DB.
-    if settings.project_name not in found:
-        found.insert(0, settings.project_name)
-    return found
+    projects = sorted(found)
+    if settings.project_name not in projects:
+        projects.insert(0, settings.project_name)
+    if len(projects) > 1:
+        projects.insert(0, ALL_PROJECTS)
+    return projects
 
 
 def _compute_stats(  # type: ignore[no-untyped-def]
@@ -411,9 +467,76 @@ def _compute_stats(  # type: ignore[no-untyped-def]
         stats["graph_edges"] = e
     if wiki_storage is not None:
         with contextlib.suppress(Exception):
-            pages = list(wiki_storage.walk())
-            stats["wiki_pages"] = len(pages)
+            if _is_all_projects(project_id):
+                stats["wiki_pages"] = _wiki_page_count(settings, project_id)
+            else:
+                pages = list(wiki_storage.walk())
+                stats["wiki_pages"] = len(pages)
     return stats
+
+
+def _wiki_page_count(settings, project_id: str) -> int:  # type: ignore[no-untyped-def]
+    where = "" if _is_all_projects(project_id) else "WHERE project_id = %s"
+    params: tuple[Any, ...] = () if _is_all_projects(project_id) else (project_id,)
+    with pg_conn(settings, timeout=2.0) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM agentcore_wiki_pages {where}", params)
+        row = cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _all_wiki_pages(settings, wiki_storage) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
+    """All persisted wiki pages across projects/branches for the UI."""
+    pages: list[dict[str, Any]] = []
+    with contextlib.suppress(Exception), pg_conn(settings, timeout=2.0) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT project_id, branch, rel, title, frontmatter
+              FROM agentcore_wiki_pages
+          ORDER BY project_id, branch, rel
+            """
+        )
+        for project_id, branch, rel, title, fm in cur.fetchall() or []:
+            frontmatter = fm if isinstance(fm, dict) else {}
+            sources = frontmatter.get("sources") or []
+            pages.append(
+                {
+                    "project_id": str(project_id),
+                    "branch": str(branch),
+                    "rel": str(rel),
+                    "title": str(title or frontmatter.get("title") or rel),
+                    "sources": [str(s) for s in sources],
+                }
+            )
+    if pages:
+        return pages
+
+    # Fresh/dev fallback for disk-only wiki pages.
+    root = getattr(wiki_storage, "wiki_root", None)
+    if root is None:
+        return []
+    from agentcore.wiki.storage import WikiStorage
+
+    for project_dir in sorted(Path(root).iterdir() if Path(root).exists() else []):
+        if not project_dir.is_dir():
+            continue
+        for branch_dir in sorted(p for p in project_dir.iterdir() if p.is_dir()):
+            storage = WikiStorage(
+                root,
+                project_dir.name,
+                branch_dir.name,
+                settings=getattr(wiki_storage, "settings", None),
+            )
+            for page in storage.walk():
+                pages.append(
+                    {
+                        "project_id": project_dir.name,
+                        "branch": branch_dir.name,
+                        "rel": page.rel,
+                        "title": page.title,
+                        "sources": page.sources,
+                    }
+                )
+    return pages
 
 
 def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyped-def]
@@ -428,24 +551,27 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
     DISTINCT id avoids double-counting when both sources record the
     same chain.
     """
-    sql = """
+    idem_where = "" if _is_all_projects(project_id) else "project_id = %s AND"
+    graph_where = "" if _is_all_projects(project_id) else "project_id = %s AND"
+    sql = f"""
     SELECT count(*) FROM (
       SELECT key AS id FROM agentcore_idempotency
-       WHERE project_id = %s
-         AND scope IN ('chain', 'run')
+       WHERE {idem_where}
+         scope IN ('chain', 'run')
          AND created_at > now() - interval '24 hours'
       UNION
       SELECT replace(id, 'task:', '') AS id FROM agentcore_graph_nodes
-       WHERE project_id = %s
-         AND kind = 'task'
+       WHERE {graph_where}
+         kind = 'task'
          AND last_seen > now() - interval '24 hours'
     ) AS u
     """
+    params: tuple[Any, ...] = () if _is_all_projects(project_id) else (project_id, project_id)
     with (
         pg_conn(settings, timeout=2.0) as conn,
         conn.cursor() as cur,
     ):
-        cur.execute(sql, (project_id, project_id))
+        cur.execute(sql, params)
         row = cur.fetchone()
     return int(row[0] or 0) if row else 0
 
@@ -787,18 +913,20 @@ def _agent_activity(  # type: ignore[no-untyped-def]
 
 def _graph_sizes(settings, project_id: str) -> tuple[int, int]:  # type: ignore[no-untyped-def]
     """(nodes, edges) for this project. Two count queries — cheap."""
+    where = "" if _is_all_projects(project_id) else "WHERE project_id = %s"
+    params: tuple[Any, ...] = () if _is_all_projects(project_id) else (project_id,)
     with (
         pg_conn(settings, timeout=2.0) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(
-            "SELECT count(*) FROM agentcore_graph_nodes WHERE project_id = %s",
-            (project_id,),
+            f"SELECT count(*) FROM agentcore_graph_nodes {where}",
+            params,
         )
         n = int((cur.fetchone() or [0])[0] or 0)
         cur.execute(
-            "SELECT count(*) FROM agentcore_graph_edges WHERE project_id = %s",
-            (project_id,),
+            f"SELECT count(*) FROM agentcore_graph_edges {where}",
+            params,
         )
         e = int((cur.fetchone() or [0])[0] or 0)
     return n, e
@@ -818,7 +946,9 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
     }
     if not job_queue.is_persistent:
         return out
-    sql = """
+    where = "" if _is_all_projects(project_id) else "WHERE project_id = %s"
+    params: tuple[Any, ...] = () if _is_all_projects(project_id) else (project_id,)
+    sql = f"""
     SELECT
       count(*) FILTER (WHERE status = 'queued')                             AS queued,
       count(*) FILTER (WHERE status = 'running')                            AS running,
@@ -831,13 +961,13 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
       count(*) FILTER (WHERE kind = 'runtime.chain.advance'
                          AND created_at > now() - interval '24 hours')      AS chain_24h
     FROM agentcore_jobs
-    WHERE project_id = %s
+    {where}
     """
     with (
         pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
-        cur.execute(sql, (project_id,))
+        cur.execute(sql, params)
         row = cur.fetchone()
     if row:
         out["queued"] = int(row[0] or 0)
@@ -854,14 +984,16 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
 def _recent_jobs(  # type: ignore[no-untyped-def]
     job_queue, project_id: str, *, limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Most-recent N jobs across all statuses, with a pretty age."""
+    """Most-recent queue jobs + chain executions, with a pretty age."""
     if not job_queue.is_persistent:
         return []
-    sql = """
-    SELECT id, kind, status, attempts, max_attempts, locked_by,
-           created_at, started_at, finished_at
+    where = "" if _is_all_projects(project_id) else "WHERE project_id = %s"
+    params: tuple[Any, ...] = (int(limit),) if _is_all_projects(project_id) else (project_id, int(limit))
+    sql = f"""
+    SELECT project_id, id, kind, status, attempts, max_attempts, locked_by,
+           created_at, started_at, finished_at, payload
       FROM agentcore_jobs
-     WHERE project_id = %s
+     {where}
   ORDER BY created_at DESC
      LIMIT %s
     """
@@ -869,20 +1001,148 @@ def _recent_jobs(  # type: ignore[no-untyped-def]
         pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
-        cur.execute(sql, (project_id, int(limit)))
+        cur.execute(sql, params)
         rows = cur.fetchall()
-    return [
-        {
-            "id": r[0],
-            "kind": r[1],
-            "status": r[2],
-            "attempts": r[3],
-            "max_attempts": r[4],
-            "locked_by": r[5],
-            "age": _age(r[6]),
-        }
-        for r in rows or []
-    ]
+
+    out: list[dict[str, Any]] = []
+    seen_chains: set[str] = set()
+    for r in rows or []:
+        row_project = str(r[0])
+        payload = r[10] if isinstance(r[10], dict) else {}
+        chain_id = payload.get("chain_id") or payload.get("source_task_id")
+        if chain_id:
+            seen_chains.add(f"{row_project}:{chain_id}")
+        out.append(
+            {
+                "id": r[1],
+                "project_id": row_project,
+                "kind": r[2],
+                "status": r[3],
+                "attempts": r[4],
+                "max_attempts": r[5],
+                "locked_by": r[6],
+                "age": _age(r[7]),
+                "_ts": r[7],
+                "chain_id": chain_id,
+            }
+        )
+
+    out.extend(
+        _chain_execution_jobs(
+            job_queue.settings,
+            project_id,
+            exclude_chain_ids=seen_chains,
+            limit=int(limit),
+        )
+    )
+    out = sorted(out, key=lambda r: r.get("_ts") or 0, reverse=True)[: int(limit)]
+    for r in out:
+        r.pop("_ts", None)
+    return out
+
+
+def _chain_execution_jobs(
+    settings,
+    project_id: str,
+    *,
+    exclude_chain_ids: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Synthetic job rows for chain runs recorded outside the queue.
+
+    Older CLI/non-durable runs were persisted to graph/traces/idempotency
+    but not always to `agentcore_jobs`. The Jobs UI is an operator activity
+    view, so those chain executions should still appear here.
+    """
+    graph_where = "" if _is_all_projects(project_id) else "project_id = %s AND"
+    trace_where = "" if _is_all_projects(project_id) else "project_id = %s AND"
+    idem_where = "" if _is_all_projects(project_id) else "project_id = %s AND"
+    params: tuple[Any, ...] = (
+        (int(limit),)
+        if _is_all_projects(project_id)
+        else (project_id, project_id, project_id, int(limit))
+    )
+    sql = f"""
+    WITH chain_events AS (
+      SELECT project_id,
+             replace(id, 'task:', '') AS chain_id,
+             labels,
+             last_seen AS seen_at,
+             NULL::jsonb AS payload
+        FROM agentcore_graph_nodes
+       WHERE {graph_where}
+         kind = 'task'
+      UNION ALL
+      SELECT project_id,
+             task_id AS chain_id,
+             NULL::jsonb AS labels,
+             max(at) AS seen_at,
+             NULL::jsonb AS payload
+        FROM agentcore_traces
+       WHERE {trace_where}
+         task_id IS NOT NULL
+       GROUP BY project_id, task_id
+      UNION ALL
+      SELECT project_id,
+             key AS chain_id,
+             NULL::jsonb AS labels,
+             created_at AS seen_at,
+             payload
+        FROM agentcore_idempotency
+       WHERE {idem_where}
+         scope = 'chain'
+    ),
+    latest AS (
+      SELECT DISTINCT ON (project_id, chain_id) project_id, chain_id, labels, seen_at, payload
+        FROM chain_events
+       WHERE chain_id IS NOT NULL
+    ORDER BY project_id, chain_id, seen_at DESC
+    )
+    SELECT project_id, chain_id, labels, seen_at, payload
+      FROM latest
+  ORDER BY seen_at DESC
+     LIMIT %s
+    """
+    with (
+        pg_conn(settings) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for row_project, chain_id, labels, seen_at, payload in rows:
+        row_project = str(row_project)
+        cid = str(chain_id)
+        if f"{row_project}:{cid}" in exclude_chain_ids:
+            continue
+        body = payload if isinstance(payload, dict) else {}
+        status = body.get("status") or _status_from_graph_labels(labels)
+        out.append(
+            {
+                "id": cid,
+                "project_id": row_project,
+                "kind": "chain.execution",
+                "status": status,
+                "attempts": 1,
+                "max_attempts": 1,
+                "locked_by": None,
+                "age": _age(seen_at),
+                "_ts": seen_at,
+                "chain_id": cid,
+            }
+        )
+    return out
+
+
+def _status_from_graph_labels(labels: Any) -> str:
+    lbls = labels if isinstance(labels, dict) else {}
+    if "qa_passed" in lbls or "positive" in lbls:
+        return "done"
+    if "qa_failed" in lbls or "negative" in lbls:
+        return "failed"
+    if "dev_revised" in lbls or "architect_revised" in lbls:
+        return "incomplete"
+    return "ran"
 
 
 def _chain_jobs(  # type: ignore[no-untyped-def]
@@ -956,28 +1216,35 @@ def _graph_snapshot(  # type: ignore[no-untyped-def]
     (by incident active_weight) plus every edge between members.
     Returns `(nodes, edges, kind_counts)`.
     """
-    nodes_sql = """
+    all_projects = _is_all_projects(project_id)
+    node_where = "" if all_projects else "WHERE n.project_id = %s"
+    nodes_params: tuple[Any, ...] = (
+        (int(limit_nodes),)
+        if all_projects
+        else (project_id, int(limit_nodes))
+    )
+    nodes_sql = f"""
     WITH weighted AS (
-      SELECT n.id, n.kind, n.attrs,
+      SELECT n.project_id, n.id, n.kind, n.attrs,
              coalesce(sum(e.active_weight), 0.0) AS score
         FROM agentcore_graph_nodes n
         LEFT JOIN agentcore_graph_edges e
           ON (e.source = n.id OR e.target = n.id)
          AND e.project_id = n.project_id
-       WHERE n.project_id = %s
-       GROUP BY n.id, n.kind, n.attrs
+       {node_where}
+       GROUP BY n.project_id, n.id, n.kind, n.attrs
     )
-    SELECT id, kind, attrs, score
+    SELECT project_id, id, kind, attrs, score
       FROM weighted
-  ORDER BY score DESC, id
+  ORDER BY score DESC, project_id, id
      LIMIT %s
     """
     edges_sql = """
-    SELECT source, target, relation, active_weight
+    SELECT project_id, source, target, relation, active_weight
       FROM agentcore_graph_edges
-     WHERE project_id = %s
-       AND source = ANY(%s)
+     WHERE source = ANY(%s)
        AND target = ANY(%s)
+       AND project_id = ANY(%s)
     """
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -987,27 +1254,46 @@ def _graph_snapshot(  # type: ignore[no-untyped-def]
             pg_conn(settings) as conn,
             conn.cursor() as cur,
         ):
-            cur.execute(nodes_sql, (project_id, int(limit_nodes)))
-            for node_id, kind, attrs, score in cur.fetchall() or []:
+            cur.execute(nodes_sql, nodes_params)
+            selected_projects: set[str] = set()
+            db_ids: set[str] = set()
+            for row_project, node_id, kind, attrs, score in cur.fetchall() or []:
+                row_project = str(row_project)
+                node_id = str(node_id)
+                selected_projects.add(row_project)
+                db_ids.add(node_id)
+                ui_id = f"{row_project}:{node_id}" if all_projects else node_id
+                node_attrs = attrs if isinstance(attrs, dict) else {}
+                if all_projects:
+                    node_attrs = {**node_attrs, "project_id": row_project}
                 nodes.append(
                     {
-                        "id": str(node_id),
+                        "id": ui_id,
                         "kind": str(kind),
-                        "label": str(node_id).split(":", 1)[-1][:40],
+                        "label": (
+                            f"{row_project}/{node_id.split(':', 1)[-1]}"[:40]
+                            if all_projects
+                            else node_id.split(":", 1)[-1][:40]
+                        ),
                         "score": float(score or 0.0),
-                        "attrs": attrs if isinstance(attrs, dict) else {},
+                        "attrs": node_attrs,
                     }
                 )
                 kinds[str(kind)] = kinds.get(str(kind), 0) + 1
 
             if nodes:
-                ids = [n["id"] for n in nodes]
-                cur.execute(edges_sql, (project_id, ids, ids))
-                for source, target, relation, w in cur.fetchall() or []:
+                ids = list(db_ids)
+                cur.execute(edges_sql, (ids, ids, list(selected_projects)))
+                for row_project, source, target, relation, w in cur.fetchall() or []:
+                    row_project = str(row_project)
                     edges.append(
                         {
-                            "source": str(source),
-                            "target": str(target),
+                            "source": (
+                                f"{row_project}:{source}" if all_projects else str(source)
+                            ),
+                            "target": (
+                                f"{row_project}:{target}" if all_projects else str(target)
+                            ),
                             "relation": str(relation),
                             "weight": float(w or 1.0),
                         }
@@ -1040,26 +1326,32 @@ def _recent_chains(  # type: ignore[no-untyped-def]
 
     pid = project_id or settings.project_name
     out: dict[str, dict[str, Any]] = {}
+    all_projects = _is_all_projects(pid)
 
     with (
         pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
         # Source 1: HTTP-driven chains via idempotency cache.
+        idem_where = "" if all_projects else "project_id = %s AND"
+        idem_params: tuple[Any, ...] = (int(limit),) if all_projects else (pid, int(limit))
         cur.execute(
-            """
-            SELECT key, payload, created_at
+            f"""
+            SELECT project_id, key, payload, created_at
               FROM agentcore_idempotency
-             WHERE project_id = %s AND scope = 'chain'
+             WHERE {idem_where} scope = 'chain'
           ORDER BY created_at DESC
              LIMIT %s
             """,
-            (pid, int(limit)),
+            idem_params,
         )
-        for key, payload, created_at in cur.fetchall() or []:
+        for row_project, key, payload, created_at in cur.fetchall() or []:
+            row_project = str(row_project)
             body = payload if isinstance(payload, dict) else {}
-            out[str(key)] = {
+            out_key = f"{row_project}:{key}"
+            out[out_key] = {
                 "chain_id": str(key),
+                "project_id": row_project,
                 "status": body.get("status", "done"),
                 "hops": body.get("hops") or [],
                 "updated_at": _age(created_at),
@@ -1071,29 +1363,40 @@ def _recent_chains(  # type: ignore[no-untyped-def]
         # We pull two metrics in the same query: how many distinct
         # agents handed off on this chain (= hop count) and the labels
         # (for status inference).
+        graph_where = "" if all_projects else "WHERE project_id = %s"
+        node_where = "" if all_projects else "n.project_id = %s AND"
+        graph_params: tuple[Any, ...] = (
+            (int(limit),)
+            if all_projects
+            else (pid, pid, int(limit))
+        )
         cur.execute(
-            """
+            f"""
             SELECT
+                n.project_id,
                 replace(n.id, 'task:', '') AS chain_id,
                 n.labels,
                 n.last_seen,
                 COALESCE(h.hop_count, 0) AS hop_count
               FROM agentcore_graph_nodes n
               LEFT JOIN (
-                SELECT target, count(*) AS hop_count
+                SELECT project_id, target, count(*) AS hop_count
                   FROM agentcore_graph_edges
-                 WHERE project_id = %s AND relation = 'worked_on'
-                 GROUP BY target
-              ) AS h ON h.target = n.id
-             WHERE n.project_id = %s AND n.kind = 'task'
+                 {graph_where}
+                   {"AND" if not all_projects else "WHERE"} relation = 'worked_on'
+                 GROUP BY project_id, target
+              ) AS h ON h.project_id = n.project_id AND h.target = n.id
+             WHERE {node_where} n.kind = 'task'
           ORDER BY n.last_seen DESC
              LIMIT %s
             """,
-            (pid, pid, int(limit)),
+            graph_params,
         )
-        for chain_id, labels, last_seen, hop_count in cur.fetchall() or []:
+        for row_project, chain_id, labels, last_seen, hop_count in cur.fetchall() or []:
+            row_project = str(row_project)
             cid = str(chain_id)
-            if cid in out:
+            out_key = f"{row_project}:{cid}"
+            if out_key in out:
                 continue  # idempotency entry wins (richer)
             lbls = labels if isinstance(labels, dict) else {}
             # Infer status from PRF labels. None of these mean the
@@ -1111,8 +1414,9 @@ def _recent_chains(  # type: ignore[no-untyped-def]
                 status = "incomplete"      # ran some hops, never tagged terminal
             else:
                 status = "unknown"
-            out[cid] = {
+            out[out_key] = {
                 "chain_id": cid,
+                "project_id": row_project,
                 "status": status,
                 # Hops as a list-of-dicts so the template's `c.hops|length`
                 # reads the same as for HTTP-source rows. Content is a

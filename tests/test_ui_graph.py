@@ -13,7 +13,9 @@ def test_known_projects_includes_graph_edges_and_traces(monkeypatch) -> None:
         project_name = "default"
 
     class _Cursor:
-        sql = ""
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+            self.sql = ""
 
         def __enter__(self):
             return self
@@ -23,9 +25,16 @@ def test_known_projects_includes_graph_edges_and_traces(monkeypatch) -> None:
 
         def execute(self, sql: str) -> None:
             self.sql = sql
+            self.statements.append(sql)
+            if "agentcore_wiki_pages" in sql:
+                raise RuntimeError("missing table")
 
         def fetchall(self) -> list[tuple[str]]:
-            return [("trace-only",), ("edge-only",)]
+            if "agentcore_graph_edges" in self.sql:
+                return [("edge-only",)]
+            if "agentcore_traces" in self.sql:
+                return [("trace-only",)]
+            return []
 
     class _Connection:
         def __init__(self, cursor: _Cursor) -> None:
@@ -48,9 +57,15 @@ def test_known_projects_includes_graph_edges_and_traces(monkeypatch) -> None:
 
     monkeypatch.setattr(routes, "pg_conn", fake_pg_conn)
 
-    assert routes._known_projects(_Settings()) == ["default", "trace-only", "edge-only"]
-    assert "agentcore_graph_edges" in cursor.sql
-    assert "agentcore_traces" in cursor.sql
+    assert routes._known_projects(_Settings()) == [
+        "__all__",
+        "default",
+        "edge-only",
+        "trace-only",
+    ]
+    assert any("agentcore_graph_edges" in sql for sql in cursor.statements)
+    assert any("agentcore_traces" in sql for sql in cursor.statements)
+    assert any("agentcore_wiki_pages" in sql for sql in cursor.statements)
 
 
 def test_graph_snapshot_scopes_edge_weight_join_to_project(monkeypatch) -> None:
@@ -71,7 +86,7 @@ def test_graph_snapshot_scopes_edge_weight_join_to_project(monkeypatch) -> None:
         def fetchall(self) -> list[tuple[Any, ...]]:
             self._fetch += 1
             if self._fetch == 1:
-                return [("task:abc", "task", {}, 1.0)]
+                return [("prior-project", "task:abc", "task", {}, 1.0)]
             return []
 
     class _Connection:
