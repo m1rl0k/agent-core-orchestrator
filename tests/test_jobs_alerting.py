@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 from pydantic_settings import SettingsConfigDict
@@ -9,6 +10,18 @@ from pydantic_settings import SettingsConfigDict
 import agentcore.state.jobs as jobs_module
 from agentcore.settings import Settings
 from agentcore.state.jobs import JobQueue
+
+
+def _patch_pg_conn(monkeypatch, connection):  # type: ignore[no-untyped-def]
+    """Patch the pooled `pg_conn` context manager that `jobs_module`
+    now uses (was `psycopg.connect`). Returning a real context manager
+    so the `with (pg_conn(...) as conn, ...)` shape stays valid."""
+
+    @contextmanager
+    def fake_pg_conn(*_args, **_kwargs):
+        yield connection
+
+    monkeypatch.setattr(jobs_module, "pg_conn", fake_pg_conn)
 
 
 class _IsolatedSettings(Settings):
@@ -68,11 +81,7 @@ def test_dead_letter_transition_emits_structured_alert(monkeypatch) -> None:
     queue._persistent = True
 
     monkeypatch.setattr(jobs_module, "log", recorder)
-    monkeypatch.setattr(
-        jobs_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+    _patch_pg_conn(monkeypatch, _Connection(cursor))
 
     queue.fail(42, "boom")
 
@@ -99,11 +108,7 @@ def test_retryable_failure_does_not_emit_dead_letter_alert(monkeypatch) -> None:
     queue._persistent = True
 
     monkeypatch.setattr(jobs_module, "log", recorder)
-    monkeypatch.setattr(
-        jobs_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+    _patch_pg_conn(monkeypatch, _Connection(cursor))
 
     queue.fail(42, "try again")
 

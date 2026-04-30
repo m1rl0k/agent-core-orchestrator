@@ -24,6 +24,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from agentcore.state.db import pg_conn
+
 _HERE = Path(__file__).resolve().parent
 _TEMPLATES = Jinja2Templates(directory=str(_HERE / "templates"))
 
@@ -315,8 +317,6 @@ def _known_projects(settings) -> list[str]:  # type: ignore[no-untyped-def]
     """All project_ids that have state anywhere in the DB. Populates the
     header switcher so an operator can jump between tenants without
     knowing the names ahead of time. Best-effort; empty on DB miss."""
-    import psycopg
-
     sql = """
     SELECT DISTINCT project_id FROM agentcore_jobs
     UNION
@@ -327,7 +327,7 @@ def _known_projects(settings) -> list[str]:  # type: ignore[no-untyped-def]
     """
     try:
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            pg_conn(settings, timeout=2.0) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(sql)
@@ -397,8 +397,6 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
     DISTINCT id avoids double-counting when both sources record the
     same chain.
     """
-    import psycopg
-
     sql = """
     SELECT count(*) FROM (
       SELECT key AS id FROM agentcore_idempotency
@@ -413,7 +411,7 @@ def _chain_count_24h(settings, project_id: str) -> int:  # type: ignore[no-untyp
     ) AS u
     """
     with (
-        psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+        pg_conn(settings, timeout=2.0) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(sql, (project_id, project_id))
@@ -456,8 +454,6 @@ def _chain_review_history(
 def _chain_review_history_pg(
     settings, chain_id: str, project_id: str  # type: ignore[no-untyped-def]
 ) -> list[dict[str, Any]]:
-    import psycopg
-
     kinds = ("verdict", "route_back", "result", "review_round")
     sql = """
     SELECT step, kind, actor, at, detail
@@ -469,7 +465,7 @@ def _chain_review_history_pg(
     """
     try:
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            pg_conn(settings, timeout=2.0) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(sql, (project_id, chain_id, list(kinds)))
@@ -529,12 +525,10 @@ def _chain_detail_from_graph(  # type: ignore[no-untyped-def]
     Returns the same shape as an idempotency-stored chain:
       {chain_id, status, hops: [{agent, status, output?}]}
     """
-    import psycopg
-
     task_id = f"task:{chain_id}"
     try:
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            pg_conn(settings, timeout=2.0) as conn,
             conn.cursor() as cur,
         ):
             # The task node — gives us labels for status inference.
@@ -669,12 +663,10 @@ def _agent_activity(  # type: ignore[no-untyped-def]
     delegations_received}}`. Empty dict on DB miss (UI degrades to
     static info).
     """
-    import psycopg
-
     out: dict[str, dict[str, Any]] = {}
     try:
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+            pg_conn(settings, timeout=2.0) as conn,
             conn.cursor() as cur,
         ):
             # Total tasks each agent worked on (one edge per agent per
@@ -749,10 +741,8 @@ def _agent_activity(  # type: ignore[no-untyped-def]
 
 def _graph_sizes(settings, project_id: str) -> tuple[int, int]:  # type: ignore[no-untyped-def]
     """(nodes, edges) for this project. Two count queries — cheap."""
-    import psycopg
-
     with (
-        psycopg.connect(settings.pg_dsn, autocommit=True, connect_timeout=2) as conn,
+        pg_conn(settings, timeout=2.0) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(
@@ -770,8 +760,6 @@ def _graph_sizes(settings, project_id: str) -> tuple[int, int]:  # type: ignore[
 
 def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[no-untyped-def]
     """Aggregate counts for the dashboard stat cards. One query."""
-    import psycopg
-
     out = {
         "queued": 0,
         "running": 0,
@@ -800,7 +788,7 @@ def _job_counts(job_queue, project_id: str) -> dict[str, int]:  # type: ignore[n
     WHERE project_id = %s
     """
     with (
-        psycopg.connect(job_queue.settings.pg_dsn, autocommit=True) as conn,
+        pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(sql, (project_id,))
@@ -821,8 +809,6 @@ def _recent_jobs(  # type: ignore[no-untyped-def]
     job_queue, project_id: str, *, limit: int = 50
 ) -> list[dict[str, Any]]:
     """Most-recent N jobs across all statuses, with a pretty age."""
-    import psycopg
-
     if not job_queue.is_persistent:
         return []
     sql = """
@@ -834,7 +820,7 @@ def _recent_jobs(  # type: ignore[no-untyped-def]
      LIMIT %s
     """
     with (
-        psycopg.connect(job_queue.settings.pg_dsn, autocommit=True) as conn,
+        pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(sql, (project_id, int(limit)))
@@ -863,8 +849,6 @@ def _chain_in_flight_jobs(  # type: ignore[no-untyped-def]
     this is the only signal of progress beyond the hop counter in
     the cached state.
     """
-    import psycopg
-
     if not job_queue.is_persistent:
         return []
     sql = """
@@ -877,7 +861,7 @@ def _chain_in_flight_jobs(  # type: ignore[no-untyped-def]
      LIMIT 20
     """
     with (
-        psycopg.connect(job_queue.settings.pg_dsn, autocommit=True) as conn,
+        pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
         cur.execute(sql, (project_id, chain_id))
@@ -903,8 +887,6 @@ def _graph_snapshot(  # type: ignore[no-untyped-def]
     (by incident active_weight) plus every edge between members.
     Returns `(nodes, edges, kind_counts)`.
     """
-    import psycopg
-
     nodes_sql = """
     WITH weighted AS (
       SELECT n.id, n.kind, n.attrs,
@@ -933,7 +915,7 @@ def _graph_snapshot(  # type: ignore[no-untyped-def]
     kinds: dict[str, int] = {}
     try:
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(nodes_sql, (project_id, int(limit_nodes)))
@@ -984,8 +966,6 @@ def _recent_chains(  # type: ignore[no-untyped-def]
     Idempotency entries take precedence when a chain id appears in
     both sources (richer payload).
     """
-    import psycopg
-
     if not job_queue.is_persistent:
         return []
 
@@ -993,7 +973,7 @@ def _recent_chains(  # type: ignore[no-untyped-def]
     out: dict[str, dict[str, Any]] = {}
 
     with (
-        psycopg.connect(job_queue.settings.pg_dsn, autocommit=True) as conn,
+        pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
         # Source 1: HTTP-driven chains via idempotency cache.

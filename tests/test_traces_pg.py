@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,6 +11,18 @@ from pydantic_settings import SettingsConfigDict
 import agentcore.orchestrator.traces as traces_module
 from agentcore.orchestrator.traces import TraceEvent, TraceLog
 from agentcore.settings import Settings
+
+
+def _patch_pg_conn(monkeypatch, connection):  # type: ignore[no-untyped-def]
+    """Patch the pooled `pg_conn` context manager that traces_module uses
+    (was `psycopg.connect`). Yields a real context manager so the
+    `with (pg_conn(...) as conn, ...)` shape stays valid."""
+
+    @contextmanager
+    def fake_pg_conn(*_args, **_kwargs):
+        yield connection
+
+    monkeypatch.setattr(traces_module, "pg_conn", fake_pg_conn)
 
 
 class _IsolatedSettings(Settings):
@@ -69,11 +82,7 @@ def test_trace_log_writes_project_scoped_rows(monkeypatch) -> None:
     log.settings = settings
     log._persistent = True
 
-    monkeypatch.setattr(
-        traces_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+    _patch_pg_conn(monkeypatch, _Connection(cursor))
 
     log.record(
         TraceEvent(
@@ -101,11 +110,7 @@ def test_trace_log_reads_project_scoped_rows(monkeypatch) -> None:
     log.settings = _IsolatedSettings(AGENTCORE_PROJECT_NAME="default")
     log._persistent = True
 
-    monkeypatch.setattr(
-        traces_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+    _patch_pg_conn(monkeypatch, _Connection(cursor))
 
     rows = log.for_task("task-1", project_id="tenant-a")
 
@@ -122,11 +127,7 @@ def test_trace_cleanup_uses_retention_days(monkeypatch) -> None:
     log.settings = _IsolatedSettings()
     log._persistent = True
 
-    monkeypatch.setattr(
-        traces_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+    _patch_pg_conn(monkeypatch, _Connection(cursor))
 
     assert log.cleanup(retention_days=14) == 7
     assert cursor.statements[-1][1] == ("14",)
