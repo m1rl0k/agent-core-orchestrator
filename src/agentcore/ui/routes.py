@@ -11,20 +11,18 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import structlog
-
-log = structlog.get_logger(__name__)
-
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from agentcore.state.db import pg_conn
+
+log = structlog.get_logger(__name__)
 
 _HERE = Path(__file__).resolve().parent
 _TEMPLATES = Jinja2Templates(directory=str(_HERE / "templates"))
@@ -89,6 +87,21 @@ def mount_ui(  # type: ignore[no-untyped-def]
             return h
         return settings.project_name
 
+    def _project_qs(request: Request, pid: str) -> str:
+        """`?project=<pid>` suffix to thread through nav links so the
+        operator's tenant choice survives navigation. Empty when the
+        project is implicit (server default with no explicit override)
+        — keeps default-tenant URLs clean and shareable."""
+        explicit = (
+            request.query_params.get("project")
+            or request.headers.get("x-project-id")
+        )
+        if not explicit:
+            return ""
+        from urllib.parse import quote
+
+        return f"?project={quote(pid, safe='')}"
+
     def _ctx(request: Request, active: str, **extra: Any) -> dict[str, Any]:
         pid = _pid(request)
         projects = _known_projects(settings)
@@ -96,6 +109,7 @@ def mount_ui(  # type: ignore[no-untyped-def]
             "request": request,
             "active": active,
             "project": pid,
+            "project_qs": _project_qs(request, pid),
             "projects": projects,
             "wiki_enabled": settings.enable_wiki,
             **extra,
@@ -206,7 +220,7 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 "chains",
                 chain_id=chain_id,
                 chain=detail["chain"],  # None if neither source has it
-                in_flight=detail["in_flight"],
+                chain_jobs=detail["chain_jobs"],
                 review_history=detail["review_history"],
             ),
         )
@@ -214,9 +228,19 @@ def mount_ui(  # type: ignore[no-untyped-def]
     @app.get("/ui/graph", response_class=HTMLResponse, name="ui-graph")
     async def ui_graph(request: Request) -> HTMLResponse:
         pid = _pid(request)
+        raw_limit = request.query_params.get("limit", "1000")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            limit = 1000
+        limit = max(50, min(limit, 5000))
         nodes, edges, kinds = _cached(
-            (pid, "graph_snapshot"),
-            lambda: _graph_snapshot(settings, limit_nodes=200, project_id=pid),
+            (pid, f"graph_snapshot:{limit}"),
+            lambda: _graph_snapshot(settings, limit_nodes=limit, project_id=pid),
+        )
+        total_nodes, total_edges = _cached(
+            (pid, "graph_sizes"),
+            lambda: _graph_sizes(settings, pid),
         )
         return _TEMPLATES.TemplateResponse(
             request,
@@ -229,6 +253,9 @@ def mount_ui(  # type: ignore[no-untyped-def]
                 kinds=kinds,
                 node_count=len(nodes),
                 edge_count=len(edges),
+                total_node_count=total_nodes,
+                total_edge_count=total_edges,
+                graph_limit=limit,
             ),
         )
 
@@ -323,6 +350,10 @@ def _known_projects(settings) -> list[str]:  # type: ignore[no-untyped-def]
     SELECT DISTINCT project_id FROM agentcore_idempotency
     UNION
     SELECT DISTINCT project_id FROM agentcore_graph_nodes
+    UNION
+    SELECT DISTINCT project_id FROM agentcore_graph_edges
+    UNION
+    SELECT DISTINCT project_id FROM agentcore_traces
     ORDER BY 1
     """
     try:
@@ -428,13 +459,28 @@ def _load_chain_detail(  # type: ignore[no-untyped-def]
     # so CLI-driven chains (which never touch the idempotency cache)
     # still render a useful detail view.
     chain = idem_cache.get("chain", chain_id, project_id=project_id)
+    graph_chain = _chain_detail_from_graph(settings, chain_id, project_id)
     if chain is None:
-        chain = _chain_detail_from_graph(settings, chain_id, project_id)
+        chain = graph_chain
+    elif graph_chain:
+        chain = _merge_graph_chain_detail(chain, graph_chain)
     return {
         "chain": chain,
-        "in_flight": _chain_in_flight_jobs(job_queue, chain_id, project_id=project_id),
+        "chain_jobs": _chain_jobs(job_queue, chain_id, project_id=project_id),
         "review_history": _chain_review_history(settings, chain_id, project_id),
     }
+
+
+def _merge_graph_chain_detail(
+    chain: dict[str, Any], graph_chain: dict[str, Any]
+) -> dict[str, Any]:
+    """Add graph-only UI context without replacing richer cached hops."""
+    merged = dict(chain)
+    for key in ("files_touched", "snippets_produced", "last_seen", "_source"):
+        value = graph_chain.get(key)
+        if value and not merged.get(key):
+            merged[key] = value
+    return merged
 
 
 def _chain_review_history(
@@ -839,42 +885,65 @@ def _recent_jobs(  # type: ignore[no-untyped-def]
     ]
 
 
-def _chain_in_flight_jobs(  # type: ignore[no-untyped-def]
+def _chain_jobs(  # type: ignore[no-untyped-def]
     job_queue, chain_id: str, *, project_id: str
 ) -> list[dict[str, Any]]:
-    """Any `runtime.chain.advance` jobs still referencing this chain.
-
-    Useful while the chain is mid-flight — the terminal idempotency
-    row only appears on done/failed/cancelled, so for a live chain
-    this is the only signal of progress beyond the hop counter in
-    the cached state.
-    """
+    """Queue rows related to a chain, across active and terminal statuses."""
     if not job_queue.is_persistent:
         return []
     sql = """
-    SELECT id, status, attempts, created_at, locked_by
+    SELECT id, kind, status, attempts, max_attempts, created_at, started_at,
+           finished_at, locked_by, created_by, error
       FROM agentcore_jobs
      WHERE project_id = %s
-       AND kind = 'runtime.chain.advance'
-       AND payload->>'chain_id' = %s
+       AND (
+            payload->>'chain_id' = %s
+         OR payload->>'source_task_id' = %s
+         OR idempotency_key = %s
+         OR idempotency_key LIKE %s
+         OR created_by = %s
+       )
   ORDER BY created_at DESC
-     LIMIT 20
+     LIMIT 50
     """
     with (
         pg_conn(job_queue.settings) as conn,
         conn.cursor() as cur,
     ):
-        cur.execute(sql, (project_id, chain_id))
+        cur.execute(
+            sql,
+            (
+                project_id,
+                chain_id,
+                chain_id,
+                f"chain:{chain_id}",
+                f"{chain_id}:%",
+                f"chain:{chain_id}",
+            ),
+        )
         return [
             {
                 "id": r[0],
-                "status": r[1],
-                "attempts": r[2],
-                "age": _age(r[3]),
-                "locked_by": r[4],
+                "kind": r[1],
+                "status": r[2],
+                "attempts": r[3],
+                "max_attempts": r[4],
+                "age": _age(r[5]),
+                "started": _age(r[6]),
+                "finished": _age(r[7]),
+                "locked_by": r[8],
+                "created_by": r[9],
+                "error": r[10],
             }
             for r in cur.fetchall() or []
         ]
+
+
+def _chain_in_flight_jobs(  # type: ignore[no-untyped-def]
+    job_queue, chain_id: str, *, project_id: str
+) -> list[dict[str, Any]]:
+    """Backward-compatible alias for older tests/callers."""
+    return _chain_jobs(job_queue, chain_id, project_id=project_id)
 
 
 def _graph_snapshot(  # type: ignore[no-untyped-def]
@@ -893,7 +962,7 @@ def _graph_snapshot(  # type: ignore[no-untyped-def]
              coalesce(sum(e.active_weight), 0.0) AS score
         FROM agentcore_graph_nodes n
         LEFT JOIN agentcore_graph_edges e
-          ON e.source = n.id OR e.target = n.id
+          ON (e.source = n.id OR e.target = n.id)
          AND e.project_id = n.project_id
        WHERE n.project_id = %s
        GROUP BY n.id, n.kind, n.attrs

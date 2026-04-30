@@ -22,6 +22,8 @@ class runs in memory-only mode, preserving fast unit tests and local algorithms.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ import networkx as nx
 import psycopg
 
 from agentcore.settings import Settings
+from agentcore.state.db import pg_conn
 
 GRAPH_DDL = """
 CREATE TABLE IF NOT EXISTS agentcore_graph_nodes (
@@ -170,10 +173,12 @@ class KnowledgeGraph:
     def is_persistent(self) -> bool:
         return self.settings is not None
 
-    def _conn(self) -> psycopg.Connection:
+    @contextmanager
+    def _conn(self) -> Iterator[psycopg.Connection]:
         if self.settings is None:
             raise RuntimeError("KnowledgeGraph is running in memory-only mode")
-        return psycopg.connect(self.settings.pg_dsn, autocommit=True)
+        with pg_conn(self.settings) as conn:
+            yield conn
 
     def init_schema(self) -> None:
         """Create durable graph tables when Postgres persistence is enabled."""

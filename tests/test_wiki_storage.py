@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -180,14 +181,18 @@ class _Connection:
 
 
 def _persistent_storage(tmp_path: Path, cursor: _Cursor, monkeypatch) -> WikiStorage:
+    """Wire `WikiStorage` against the in-memory cursor by patching the
+    pooled `pg_conn` context manager that `storage_module` now uses
+    (was `psycopg.connect`)."""
     s = _new_storage(tmp_path)
     s.settings = _IsolatedSettings()
     s._persistent = True
-    monkeypatch.setattr(
-        storage_module.psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(cursor),
-    )
+
+    @contextmanager
+    def fake_pg_conn(*_args, **_kwargs):
+        yield _Connection(cursor)
+
+    monkeypatch.setattr(storage_module, "pg_conn", fake_pg_conn)
     return s
 
 

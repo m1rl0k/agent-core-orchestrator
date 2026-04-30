@@ -28,16 +28,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-import psycopg
-from pgvector.psycopg import register_vector
-
 from agentcore.memory.embed import DEFAULT_MODEL, EMBED_DIM, embedding_dim_for_model
 from agentcore.settings import Settings, get_settings
+from agentcore.state.db import pg_conn
 
 
 def _build_ddl(dim: int) -> str:
@@ -75,48 +71,15 @@ class Hit:
     metadata: dict[str, Any]
 
 
-def _configure_conn(conn: psycopg.Connection) -> None:
-    register_vector(conn)
-
-
 class VectorStore:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self._pool: Any | None = None
-        self._pool_available = True
 
-    def _ensure_pool(self) -> Any | None:
-        if not self._pool_available:
-            return None
-        if self._pool is None:
-            try:
-                from psycopg_pool import ConnectionPool
-            except ImportError:
-                self._pool_available = False
-                return None
-            self._pool = ConnectionPool(
-                conninfo=self.settings.pg_dsn,
-                min_size=1,
-                max_size=8,
-                kwargs={"autocommit": True},
-                configure=_configure_conn,
-                open=True,
-            )
-        return self._pool
-
-    @contextmanager
-    def _conn(self) -> Iterator[psycopg.Connection]:
-        pool = self._ensure_pool()
-        if pool is None:
-            conn = psycopg.connect(self.settings.pg_dsn, autocommit=True)
-            try:
-                _configure_conn(conn)
-                yield conn
-            finally:
-                conn.close()
-            return
-        with pool.connection() as conn:
-            yield conn
+    def _conn(self):  # type: ignore[no-untyped-def]
+        # Pooled connection from the process-wide pool. Pgvector adapters
+        # are registered in the pool's `_configure_conn` so vector binds
+        # work on every checkout.
+        return pg_conn(self.settings)
 
     def init_schema(self, dim: int | None = None) -> None:
         """Create the chunks table at the requested embedding dimension.
@@ -215,6 +178,6 @@ class VectorStore:
             return cur.rowcount
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-            self._pool = None
+        # No-op: connection lifecycle is owned by the shared pool in
+        # `agentcore.state.db`. Kept for API compatibility.
+        return None

@@ -4,9 +4,29 @@
 <div class="page-header">
   <div>
     <h1>Knowledge graph</h1>
-    <p class="subtitle">Top {{ node_count }} nodes by edge weight · {{ edge_count }} edges</p>
+    <p class="subtitle">
+      Showing {{ node_count }} of {{ total_node_count }} nodes by edge weight ·
+      {{ edge_count }} of {{ total_edge_count }} edges
+    </p>
   </div>
   <div class="row">
+    <form method="get" class="row" style="margin: 0; gap: 6px">
+      <input type="hidden" name="project" value="{{ project }}" />
+      <label class="small muted" style="margin: 0">
+        limit
+        <input
+          type="number"
+          name="limit"
+          value="{{ graph_limit }}"
+          min="50"
+          max="5000"
+          step="50"
+          class="mono"
+          style="width: 90px; padding: 4px 8px; font-size: 12px; margin: 0 0 0 4px"
+        />
+      </label>
+      <button class="outline small" style="padding: 3px 10px">load</button>
+    </form>
     {% for kind, n in kinds.items() %}
       <button
         class="outline kind-filter badge badge-{{ kind }}"
@@ -22,7 +42,8 @@
   <div class="card-title" style="padding: 12px 16px 0">
     <h2 style="margin: 0">Graph view</h2>
     <div class="muted small">
-      scroll to zoom · drag canvas to pan · click node for details
+      <span id="graph-visible-counts">rendering…</span> · scroll to zoom · drag canvas to pan · drag nodes to rearrange
+      <button id="clear-filters" class="outline small" style="margin-left: 12px; padding: 2px 8px">show all</button>
       <button id="reset-view" class="outline small" style="margin-left: 12px; padding: 2px 8px">reset</button>
     </div>
   </div>
@@ -57,7 +78,7 @@
 <section class="card">
   <div class="card-title">
     <h2>Nodes</h2>
-    <span class="muted small">top {{ nodes|length }} by weight</span>
+    <span class="muted small">top {{ nodes|length }} by weight{% if nodes|length < total_node_count %} · increase limit to see more{% endif %}</span>
   </div>
   <table>
     <thead><tr><th>ID</th><th>Kind</th><th>Weight</th></tr></thead>
@@ -91,6 +112,8 @@
   const ipAttrs = document.getElementById("ip-attrs");
   const ipEdges = document.getElementById("ip-edges");
   const resetBtn = document.getElementById("reset-view");
+  const clearFiltersBtn = document.getElementById("clear-filters");
+  const visibleCounts = document.getElementById("graph-visible-counts");
 
   const W = 900, H = 560;
   const KIND_COLOR = {
@@ -100,7 +123,7 @@
 
   // Filter state persists in localStorage keyed by project, so switching
   // tenants doesn't carry filters across. Empty set = show all.
-  const PROJECT = new URLSearchParams(window.location.search).get("project") || "default";
+  const PROJECT = {{ project|tojson }};
   const FILTER_KEY = `agentcore-graph-filters:${PROJECT}`;
   const hidden = new Set(JSON.parse(localStorage.getItem(FILTER_KEY) || "[]"));
 
@@ -140,6 +163,28 @@
       n.y += (H/2 - n.y) * 0.01;
       n.x = Math.max(20, Math.min(W-20, n.x));
       n.y = Math.max(20, Math.min(H-20, n.y));
+    }
+  }
+
+  function edgeEndpoints(e) {
+    return {
+      x1: e.s.x, y1: e.s.y,
+      x2: e.t.x, y2: e.t.y,
+    };
+  }
+
+  function setEdgeGeometry(e) {
+    const { x1, y1, x2, y2 } = edgeEndpoints(e);
+    e.el.setAttribute("x1", x1); e.el.setAttribute("y1", y1);
+    e.el.setAttribute("x2", x2); e.el.setAttribute("y2", y2);
+    e.hitEl.setAttribute("x1", x1); e.hitEl.setAttribute("y1", y1);
+    e.hitEl.setAttribute("x2", x2); e.hitEl.setAttribute("y2", y2);
+  }
+
+  function setNodeGeometry(n) {
+    n.el.setAttribute("transform", `translate(${n.x},${n.y})`);
+    for (const e of edges) {
+      if (e.s === n || e.t === n) setEdgeGeometry(e);
     }
   }
 
@@ -200,7 +245,8 @@
   for (const n of nodes) {
     const g = document.createElementNS(SVGNS, "g");
     g.setAttribute("transform", `translate(${n.x},${n.y})`);
-    g.style.cursor = "pointer";
+    g.dataset.nodeId = n.id;
+    g.style.cursor = "grab";
     const c = document.createElementNS(SVGNS, "circle");
     c.setAttribute("r", n.r);
     c.setAttribute("fill", KIND_COLOR[n.kind] || "#94a3b8");
@@ -226,7 +272,15 @@
       g.addEventListener("mouseenter", () => label.setAttribute("opacity", "0.85"));
       g.addEventListener("mouseleave", () => label.setAttribute("opacity", "0"));
     }
-    g.addEventListener("click", (ev) => { ev.stopPropagation(); selectNode(n); });
+    g.addEventListener("pointerdown", (ev) => startNodeDrag(ev, n));
+    g.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
+      selectNode(n);
+    });
     root.appendChild(g);
     n.el = g;
     n.labelEl = label;
@@ -236,13 +290,20 @@
   applyFilters();
 
   function applyFilters() {
+    let visibleNodeCount = 0;
+    let visibleEdgeCount = 0;
     for (const n of nodes) {
-      n.el.style.display = hidden.has(n.kind) ? "none" : "";
+      const hide = hidden.has(n.kind);
+      n.el.style.display = hide ? "none" : "";
+      if (!hide) visibleNodeCount++;
     }
     for (const e of edges) {
       const hide = hidden.has(e.s.kind) || hidden.has(e.t.kind);
       e.el.style.display = hide ? "none" : "";
+      e.hitEl.style.display = hide ? "none" : "";
+      if (!hide) visibleEdgeCount++;
     }
+    visibleCounts.textContent = `${visibleNodeCount}/${nodes.length} nodes · ${visibleEdgeCount}/${edges.length} edges visible`;
     // Reflect toggled state on the filter buttons.
     document.querySelectorAll(".kind-filter").forEach(btn => {
       const k = btn.dataset.kind;
@@ -257,6 +318,13 @@
       localStorage.setItem(FILTER_KEY, JSON.stringify([...hidden]));
       applyFilters();
     });
+  });
+
+  clearFiltersBtn.addEventListener("click", () => {
+    hidden.clear();
+    localStorage.setItem(FILTER_KEY, JSON.stringify([]));
+    clearSelection();
+    applyFilters();
   });
 
   // Node selection → info panel.
@@ -286,9 +354,7 @@
     }
     // Highlight selected node + its neighbours.
     const neighbours = new Set([n.id, ...incident.flatMap(e => [e.s.id, e.t.id])]);
-    for (const m of nodes) {
-      m.el.querySelector("circle").setAttribute("opacity", neighbours.has(m.id) ? "1" : "0.2");
-    }
+    for (const m of nodes) m.el.querySelector("circle").setAttribute("opacity", neighbours.has(m.id) ? "1" : "0.2");
     for (const e of edges) {
       const on = e.s.id === n.id || e.t.id === n.id;
       e.el.setAttribute("stroke", on ? "var(--accent)" : "currentColor");
@@ -321,6 +387,10 @@
   }
 
   document.getElementById("ip-close").addEventListener("click", () => {
+    clearSelection();
+  });
+
+  function clearSelection() {
     panel.style.display = "none";
     for (const m of nodes) m.el.querySelector("circle").setAttribute("opacity", "0.9");
     for (const e of edges) {
@@ -328,16 +398,11 @@
       e.el.setAttribute("opacity", "0.25");
       e.el.setAttribute("stroke-width", "0.5");
     }
-  });
+  }
+
   svg.addEventListener("click", (ev) => {
     if (ev.target === svg || ev.target === root) {
-      panel.style.display = "none";
-      for (const m of nodes) m.el.querySelector("circle").setAttribute("opacity", "0.9");
-      for (const e of edges) {
-      e.el.setAttribute("stroke", "currentColor");
-      e.el.setAttribute("opacity", "0.25");
-      e.el.setAttribute("stroke-width", "0.5");
-    }
+      clearSelection();
     }
   });
 
@@ -373,23 +438,67 @@
     applyView();
   }, { passive: false });
 
-  // Drag → pan.
+  function svgPoint(clientX, clientY) {
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  }
+
+  function graphPoint(clientX, clientY) {
+    const p = svgPoint(clientX, clientY);
+    return { x: (p.x - view.tx) / view.scale, y: (p.y - view.ty) / view.scale };
+  }
+
+  // Drag → pan. Pointer events keep this working across mouse + trackpad.
   let dragging = false, dragStart = null;
-  svg.addEventListener("mousedown", (ev) => {
-    if (ev.target.closest("g[transform]")) return; // click on node, not drag
+  svg.addEventListener("pointerdown", (ev) => {
+    if (ev.target.closest && ev.target.closest("[data-node-id]")) return;
     dragging = true; dragStart = { x: ev.clientX - view.tx, y: ev.clientY - view.ty };
+    svg.setPointerCapture(ev.pointerId);
     svg.style.cursor = "grabbing";
   });
-  window.addEventListener("mousemove", (ev) => {
+  svg.addEventListener("pointermove", (ev) => {
     if (!dragging) return;
     view.tx = ev.clientX - dragStart.x;
     view.ty = ev.clientY - dragStart.y;
     applyView();
   });
-  window.addEventListener("mouseup", () => {
+  svg.addEventListener("pointerup", (ev) => {
     dragging = false;
+    withSuppress(() => svg.releasePointerCapture(ev.pointerId));
     svg.style.cursor = "grab";
   });
+
+  let nodeDrag = null;
+  let suppressClick = false;
+  function startNodeDrag(ev, n) {
+    ev.stopPropagation();
+    const p = graphPoint(ev.clientX, ev.clientY);
+    nodeDrag = { node: n, dx: p.x - n.x, dy: p.y - n.y, moved: false };
+    n.el.setPointerCapture(ev.pointerId);
+    n.el.style.cursor = "grabbing";
+  }
+  window.addEventListener("pointermove", (ev) => {
+    if (!nodeDrag) return;
+    const p = graphPoint(ev.clientX, ev.clientY);
+    const n = nodeDrag.node;
+    const nextX = Math.max(20, Math.min(W - 20, p.x - nodeDrag.dx));
+    const nextY = Math.max(20, Math.min(H - 20, p.y - nodeDrag.dy));
+    if (Math.abs(nextX - n.x) + Math.abs(nextY - n.y) > 2) nodeDrag.moved = true;
+    n.x = nextX; n.y = nextY;
+    setNodeGeometry(n);
+  });
+  window.addEventListener("pointerup", (ev) => {
+    if (!nodeDrag) return;
+    suppressClick = nodeDrag.moved;
+    nodeDrag.node.el.style.cursor = "grab";
+    withSuppress(() => nodeDrag.node.el.releasePointerCapture(ev.pointerId));
+    nodeDrag = null;
+  });
+
+  function withSuppress(fn) {
+    try { fn(); } catch (_e) {}
+  }
 })();
 </script>
 {% else %}

@@ -627,8 +627,9 @@ async def _plan_async_body(
     # the worker loop ignores it. Best-effort: skip silently when
     # Postgres is offline or psycopg isn't available.
     with contextlib.suppress(Exception):
-        import psycopg
         from datetime import UTC, datetime as _dt2
+
+        from agentcore.state.db import pg_conn
         chain_finished_at = _dt2.now(UTC)
         chain_status = "done" if converged else "failed"
         chain_payload = {
@@ -652,7 +653,7 @@ async def _plan_async_body(
                             blockers.append(str(b))
             chain_error = "; ".join(blockers[:5])[:500] or "rejected by review"
         with (
-            psycopg.connect(settings.pg_dsn, autocommit=True) as conn,
+            pg_conn(settings) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(

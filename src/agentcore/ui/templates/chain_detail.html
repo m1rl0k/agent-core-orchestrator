@@ -20,7 +20,7 @@
       Cancel
     </button>
     {% endif %}
-    <a href="{{ url_for('ui-chains') }}" class="small muted">← all chains</a>
+    <a href="{{ url_for('ui-chains') }}{{ project_qs }}" class="small muted">← all chains</a>
   </div>
 
 <script>
@@ -199,23 +199,41 @@
 </section>
 {% endif %}
 
-{% if in_flight %}
+{% if chain_jobs %}
 <section class="card">
   <div class="card-title">
-    <h3>Pending chain jobs</h3>
-    <span class="muted small">{{ in_flight|length }}</span>
+    <h3>Chain jobs</h3>
+    <span class="muted small">{{ chain_jobs|length }} related queue row(s)</span>
   </div>
   <table>
-    <thead><tr><th>Job</th><th>Status</th><th>Attempts</th><th>Worker</th><th>Age</th></tr></thead>
+    <thead>
+      <tr>
+        <th>Job</th>
+        <th>Kind</th>
+        <th>Status</th>
+        <th>Attempts</th>
+        <th>Worker</th>
+        <th>Created</th>
+        <th>Finished</th>
+      </tr>
+    </thead>
     <tbody>
-      {% for j in in_flight %}
+      {% for j in chain_jobs %}
       <tr>
         <td><code>{{ j.id }}</code></td>
+        <td><code>{{ j.kind }}</code></td>
         <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
-        <td class="mono">{{ j.attempts }}</td>
+        <td class="mono">{{ j.attempts }}/{{ j.max_attempts }}</td>
         <td class="small mono truncate">{{ j.locked_by or '—' }}</td>
         <td class="muted small nowrap">{{ j.age }}</td>
+        <td class="muted small nowrap">{{ j.finished or '—' }}</td>
       </tr>
+      {% if j.error %}
+      <tr>
+        <td></td>
+        <td colspan="6" class="small" style="color: var(--danger)">{{ j.error }}</td>
+      </tr>
+      {% endif %}
       {% endfor %}
     </tbody>
   </table>

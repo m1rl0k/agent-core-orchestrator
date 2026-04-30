@@ -20,7 +20,7 @@
       {% for c in chains %}
       <tr>
         <td>
-          <a href="/ui/chains/{{ c.chain_id }}" class="mono small" style="text-decoration: none">
+          <a href="/ui/chains/{{ c.chain_id }}{{ project_qs }}" class="mono small" style="text-decoration: none">
             <code>{{ c.chain_id[:16] }}…</code>
           </a>
         </td>

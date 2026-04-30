@@ -15,15 +15,15 @@
 </head>
 <body {% block body_attrs %}{% endblock %}>
   <header class="header">
-    <a href="{{ url_for('ui-dashboard') }}" class="brand">agentcore</a>
+    <a href="{{ url_for('ui-dashboard') }}{{ project_qs }}" class="brand">agentcore</a>
     <nav>
-      <a href="{{ url_for('ui-dashboard') }}" {% if active == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
-      <a href="{{ url_for('ui-agents') }}" {% if active == 'agents' %}class="active"{% endif %}>Agents</a>
-      <a href="{{ url_for('ui-chains') }}" {% if active == 'chains' %}class="active"{% endif %}>Chains</a>
-      <a href="{{ url_for('ui-jobs') }}" {% if active == 'jobs' %}class="active"{% endif %}>Jobs</a>
-      <a href="{{ url_for('ui-graph') }}" {% if active == 'graph' %}class="active"{% endif %}>Graph</a>
+      <a href="{{ url_for('ui-dashboard') }}{{ project_qs }}" {% if active == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
+      <a href="{{ url_for('ui-agents') }}{{ project_qs }}" {% if active == 'agents' %}class="active"{% endif %}>Agents</a>
+      <a href="{{ url_for('ui-chains') }}{{ project_qs }}" {% if active == 'chains' %}class="active"{% endif %}>Chains</a>
+      <a href="{{ url_for('ui-jobs') }}{{ project_qs }}" {% if active == 'jobs' %}class="active"{% endif %}>Jobs</a>
+      <a href="{{ url_for('ui-graph') }}{{ project_qs }}" {% if active == 'graph' %}class="active"{% endif %}>Graph</a>
       {% if wiki_enabled %}
-      <a href="/ui/wiki" {% if active == 'wiki' %}class="active"{% endif %}>Wiki</a>
+      <a href="/ui/wiki{{ project_qs }}" {% if active == 'wiki' %}class="active"{% endif %}>Wiki</a>
       {% endif %}
     </nav>
     <div class="row">
